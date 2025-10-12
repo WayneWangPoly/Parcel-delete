@@ -1,0 +1,5 @@
+2025-10-12 18:02:10,703 [INFO] barcode=ME1759420465462KBA attempt=1 status=200 resp={"code":110,"msg":"{\"illegalRequest\":true}"}
+2025-10-12 18:22:01,625 [INFO] barcode=ME1759420465462KBA attempt=1 status=200 resp={"code":110,"msg":"{\"illegalRequest\":true}"}
+2025-10-12 18:59:35,361 [INFO] barcode=ME1759420465462KBA attempt=1 status=200 resp={"code":110,"msg":"{\"illegalRequest\":true}"}
+2025-10-12 19:07:22,309 [INFO] barcode=ME1759420465462KBA attempt=1 status=200 resp={"code":200,"msg":"success","data":"success"}
+2025-10-12 19:23:59,378 [INFO] barcode=ME1759420465462KBA attempt=1 status=200 resp={"code":200,"msg":"success","data":"success"}
