@@ -1,6 +1,6 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-import re, json, time, base64, logging, requests
+import re, json, time, base64, logging, requests, os
 from Crypto.Cipher import AES
 
 app = Flask(__name__)
@@ -19,6 +19,10 @@ HEADERS = {
 DEFAULT_REASON = "NOREASON"
 DEFAULT_ADDRESS = "house"
 TIMEOUT = 15
+
+# 🔑 从环境变量获取 Twilio 凭证
+TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '')
+TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', '')
 
 # 相似字符映射表
 CHAR_REPLACEMENTS = {
@@ -82,20 +86,40 @@ def extract_parcel_id(text: str) -> str:
         logger.info(f"❌ 文本匹配失败")
         return None
 
-def decode_qrcode_from_url(image_url: str) -> str:
-    """使用在线 API 解析二维码"""
+def download_twilio_media(media_url: str) -> bytes:
+    """从 Twilio 下载媒体文件（需要认证）"""
     try:
-        logger.info(f"📷 使用 API 解析二维码: {image_url}")
+        logger.info(f"📥 下载 Twilio 媒体: {media_url}")
         
-        # 使用 api.qrserver.com 免费 API
-        api_url = "https://api.qrserver.com/v1/read-qr-code/"
-        
-        # 方法1：直接传递图片 URL
+        # 使用 Twilio 凭证进行 Basic Auth
         response = requests.get(
-            api_url,
-            params={'fileurl': image_url},
+            media_url,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
             timeout=15
         )
+        
+        if response.status_code == 200:
+            logger.info(f"✅ 媒体下载成功，大小: {len(response.content)} bytes")
+            return response.content
+        else:
+            logger.error(f"❌ 媒体下载失败: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"下载媒体异常: {str(e)}")
+        return None
+
+def decode_qrcode_from_image(image_bytes: bytes) -> str:
+    """使用在线 API 解析二维码（上传图片数据）"""
+    try:
+        logger.info(f"📷 使用 API 解析二维码，图片大小: {len(image_bytes)} bytes")
+        
+        # 使用 api.qrserver.com 的上传接口
+        api_url = "https://api.qrserver.com/v1/read-qr-code/"
+        
+        # 上传图片文件
+        files = {'file': ('qrcode.jpg', image_bytes, 'image/jpeg')}
+        response = requests.post(api_url, files=files, timeout=15)
         
         if response.status_code != 200:
             logger.error(f"API 请求失败: {response.status_code}")
@@ -115,6 +139,9 @@ def decode_qrcode_from_url(image_url: str) -> str:
                     # 从二维码内容中提取包裹号
                     parcel_id = extract_parcel_id(qr_data)
                     return parcel_id
+                else:
+                    error = symbol_data[0].get('error', 'unknown')
+                    logger.warning(f"二维码解析错误: {error}")
         
         logger.warning("API 未能识别二维码")
         return None
@@ -128,7 +155,7 @@ def health():
     return {
         "status": "ok",
         "service": "WhatsApp Parcel Delete Bot (Text + QR)",
-        "version": "2.1.0"
+        "version": "2.2.0"
     }
 
 @app.route("/api/whatsapp_bot", methods=["POST"])
@@ -160,13 +187,21 @@ def webhook():
             if media_type.startswith('image/'):
                 logger.info("📷 检测到图片消息，尝试识别二维码...")
                 
-                parcel_id = decode_qrcode_from_url(media_url)
+                # 先下载 Twilio 媒体
+                image_bytes = download_twilio_media(media_url)
                 
-                if parcel_id:
-                    logger.info(f"✅ 二维码识别成功: {parcel_id}")
+                if image_bytes:
+                    # 然后识别二维码
+                    parcel_id = decode_qrcode_from_image(image_bytes)
+                    
+                    if parcel_id:
+                        logger.info(f"✅ 二维码识别成功: {parcel_id}")
+                    else:
+                        logger.warning("❌ 未能从图片识别出包裹号")
+                        msg.body("❌ QR code not recognized!\n\nPlease:\n• Send clearer image\n• Ensure QR code is visible\n• Or type parcel ID directly")
+                        return str(resp)
                 else:
-                    logger.warning("❌ 未能从图片识别出包裹号")
-                    msg.body("❌ QR code not recognized!\n\nPlease:\n• Send clearer image\n• Or type parcel ID directly")
+                    msg.body("❌ Failed to download image!\n\nPlease try again.")
                     return str(resp)
             else:
                 msg.body(f"❌ Unsupported media type: {media_type}\n\nPlease send image or text.")
