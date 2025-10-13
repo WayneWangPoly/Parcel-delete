@@ -20,6 +20,21 @@ DEFAULT_REASON = "NOREASON"
 DEFAULT_ADDRESS = "house"
 TIMEOUT = 15
 
+# 🔧 相似字符映射表（西里尔字母 → 拉丁字母）
+CHAR_REPLACEMENTS = {
+    'А': 'A', 'В': 'B', 'С': 'C', 'Е': 'E', 'Н': 'H', 
+    'І': 'I', 'Ј': 'J', 'К': 'K', 'М': 'M', 'О': 'O',
+    'Р': 'P', 'Ѕ': 'S', 'Т': 'T', 'Х': 'X', 'У': 'Y',
+    'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c',
+    'х': 'x', 'у': 'y'
+}
+
+def normalize_text(text: str) -> str:
+    """标准化文本，替换相似字符"""
+    for cyrillic, latin in CHAR_REPLACEMENTS.items():
+        text = text.replace(cyrillic, latin)
+    return text
+
 def pkcs7_pad(b: bytes, block_size=16) -> bytes:
     pad_len = block_size - (len(b) % block_size)
     return b + bytes([pad_len]) * pad_len
@@ -52,10 +67,12 @@ def delete_parcel(barcode: str, reason_code=DEFAULT_REASON, address_type=DEFAULT
         return False, {"error": str(e)}
 
 def extract_parcel_id(text: str) -> str:
-    # 先移除所有空格、换行符和其他空白字符
-    text = re.sub(r'\s+', '', text.upper())
+    # 🔧 先标准化字符（西里尔 → 拉丁）
+    text = normalize_text(text)
+    logger.info(f"标准化后: '{text}'")
     
-    # 添加日志查看实际内容
+    # 移除所有空格、换行符
+    text = re.sub(r'\s+', '', text.upper())
     logger.info(f"清理后的文本: '{text}', 长度: {len(text)}")
     
     pattern = r'ME175\d{10}[A-Z0-9]{3}'
@@ -66,6 +83,9 @@ def extract_parcel_id(text: str) -> str:
         return match.group(0)
     else:
         logger.info(f"❌ 匹配失败，文本内容: {repr(text)}")
+        # 显示每个字符的 Unicode 编码帮助调试
+        char_codes = [f"{c}(U+{ord(c):04X})" for c in text[:10]]
+        logger.info(f"前10个字符编码: {' '.join(char_codes)}")
         return None
 
 @app.route("/api/whatsapp_bot", methods=["GET"])
@@ -73,7 +93,7 @@ def health():
     return {
         "status": "ok",
         "service": "WhatsApp Parcel Delete Bot",
-        "version": "1.0.1"
+        "version": "1.0.2"
     }
 
 @app.route("/api/whatsapp_bot", methods=["POST"])
@@ -82,12 +102,10 @@ def webhook():
         incoming_msg = request.values.get("Body", "").strip()
         from_number = request.values.get("From", "")
         
-        # 🔍 详细日志
         logger.info(f"========== 新消息 ==========")
         logger.info(f"发送者: {from_number}")
         logger.info(f"原始消息: '{incoming_msg}'")
         logger.info(f"消息长度: {len(incoming_msg)}")
-        logger.info(f"消息repr: {repr(incoming_msg)}")
         
         resp = MessagingResponse()
         msg = resp.message()
@@ -95,9 +113,7 @@ def webhook():
         parcel_id = extract_parcel_id(incoming_msg)
         
         if not parcel_id:
-            # 返回调试信息
-            debug_info = f"Received: {incoming_msg[:50]}\nLength: {len(incoming_msg)}"
-            msg.body(f"❌ Invalid format!\n\n{debug_info}\n\nExpected format:\nME1759420465462KBA")
+            msg.body(f"❌ Invalid format!\n\nPlease check your parcel ID.\nExpected format:\nME1759420465462KBA\n\n💡 Tip: Type manually instead of copy-paste")
             logger.info("❌ 格式验证失败")
             return str(resp)
         
@@ -119,6 +135,3 @@ def webhook():
         resp = MessagingResponse()
         resp.message("❌ System error. Please try again later.")
         return str(resp)
-
-# ⚠️ 注意：不要 app.run()！
-# Vercel 自动识别 app 变量为入口
