@@ -2,6 +2,9 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import re, json, time, base64, logging, requests
 from Crypto.Cipher import AES
+from PIL import Image
+from pyzbar.pyzbar import decode
+from io import BytesIO
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -20,7 +23,7 @@ DEFAULT_REASON = "NOREASON"
 DEFAULT_ADDRESS = "house"
 TIMEOUT = 15
 
-# 🔧 相似字符映射表（西里尔字母 → 拉丁字母）
+# 相似字符映射表
 CHAR_REPLACEMENTS = {
     'А': 'A', 'В': 'B', 'С': 'C', 'Е': 'E', 'Н': 'H', 
     'І': 'I', 'Ј': 'J', 'К': 'K', 'М': 'M', 'О': 'O',
@@ -67,13 +70,10 @@ def delete_parcel(barcode: str, reason_code=DEFAULT_REASON, address_type=DEFAULT
         return False, {"error": str(e)}
 
 def extract_parcel_id(text: str) -> str:
-    # 🔧 先标准化字符（西里尔 → 拉丁）
+    """从文本中提取包裹号"""
     text = normalize_text(text)
-    logger.info(f"标准化后: '{text}'")
-    
-    # 移除所有空格、换行符
     text = re.sub(r'\s+', '', text.upper())
-    logger.info(f"清理后的文本: '{text}', 长度: {len(text)}")
+    logger.info(f"清理后的文本: '{text}'")
     
     pattern = r'ME175\d{10}[A-Z0-9]{3}'
     match = re.search(pattern, text)
@@ -82,18 +82,48 @@ def extract_parcel_id(text: str) -> str:
         logger.info(f"✅ 匹配成功: {match.group(0)}")
         return match.group(0)
     else:
-        logger.info(f"❌ 匹配失败，文本内容: {repr(text)}")
-        # 显示每个字符的 Unicode 编码帮助调试
-        char_codes = [f"{c}(U+{ord(c):04X})" for c in text[:10]]
-        logger.info(f"前10个字符编码: {' '.join(char_codes)}")
+        logger.info(f"❌ 匹配失败")
+        return None
+
+def decode_qrcode_from_url(image_url: str) -> str:
+    """从图片URL下载并解析二维码"""
+    try:
+        logger.info(f"📷 下载图片: {image_url}")
+        response = requests.get(image_url, timeout=10)
+        
+        if response.status_code != 200:
+            logger.error(f"下载失败: {response.status_code}")
+            return None
+        
+        # 打开图片
+        img = Image.open(BytesIO(response.content))
+        logger.info(f"图片大小: {img.size}, 模式: {img.mode}")
+        
+        # 解析二维码
+        decoded_objects = decode(img)
+        logger.info(f"识别到 {len(decoded_objects)} 个二维码")
+        
+        if not decoded_objects:
+            return None
+        
+        # 获取第一个二维码的内容
+        qr_data = decoded_objects[0].data.decode('utf-8')
+        logger.info(f"🔍 二维码内容: {qr_data}")
+        
+        # 从二维码内容中提取包裹号
+        parcel_id = extract_parcel_id(qr_data)
+        return parcel_id
+        
+    except Exception as e:
+        logger.error(f"二维码解析异常: {str(e)}", exc_info=True)
         return None
 
 @app.route("/api/whatsapp_bot", methods=["GET"])
 def health():
     return {
         "status": "ok",
-        "service": "WhatsApp Parcel Delete Bot",
-        "version": "1.0.2"
+        "service": "WhatsApp Parcel Delete Bot (Text + QR)",
+        "version": "2.0.0"
     }
 
 @app.route("/api/whatsapp_bot", methods=["POST"])
@@ -102,27 +132,59 @@ def webhook():
         incoming_msg = request.values.get("Body", "").strip()
         from_number = request.values.get("From", "")
         
+        # 检查是否有图片
+        num_media = int(request.values.get("NumMedia", 0))
+        media_url = request.values.get("MediaUrl0", "")
+        media_type = request.values.get("MediaContentType0", "")
+        
         logger.info(f"========== 新消息 ==========")
         logger.info(f"发送者: {from_number}")
-        logger.info(f"原始消息: '{incoming_msg}'")
-        logger.info(f"消息长度: {len(incoming_msg)}")
+        logger.info(f"文字消息: '{incoming_msg}'")
+        logger.info(f"媒体数量: {num_media}")
+        if num_media > 0:
+            logger.info(f"媒体类型: {media_type}")
+            logger.info(f"媒体URL: {media_url}")
         
         resp = MessagingResponse()
         msg = resp.message()
         
-        parcel_id = extract_parcel_id(incoming_msg)
+        parcel_id = None
         
+        # 1️⃣ 优先处理图片（二维码）
+        if num_media > 0 and media_url:
+            if media_type.startswith('image/'):
+                logger.info("📷 检测到图片消息，尝试识别二维码...")
+                msg.body("🔍 Scanning QR code...")
+                
+                parcel_id = decode_qrcode_from_url(media_url)
+                
+                if parcel_id:
+                    logger.info(f"✅ 二维码识别成功: {parcel_id}")
+                else:
+                    logger.warning("❌ 未能从图片识别出包裹号")
+                    msg.body("❌ QR code not recognized!\n\nPlease:\n• Send clearer image\n• Or type parcel ID directly")
+                    return str(resp)
+            else:
+                msg.body(f"❌ Unsupported media type: {media_type}\n\nPlease send image or text.")
+                return str(resp)
+        
+        # 2️⃣ 如果没有图片，处理文字消息
+        if not parcel_id and incoming_msg:
+            logger.info("📝 处理文字消息...")
+            parcel_id = extract_parcel_id(incoming_msg)
+        
+        # 3️⃣ 验证是否获取到包裹号
         if not parcel_id:
-            msg.body(f"❌ Invalid format!\n\nPlease check your parcel ID.\nExpected format:\nME1759420465462KBA\n\n💡 Tip: Type manually instead of copy-paste")
-            logger.info("❌ 格式验证失败")
+            msg.body("❌ Invalid format!\n\nPlease send:\n• QR code image, or\n• Parcel ID like: ME1759420465462KBA")
             return str(resp)
         
+        # 4️⃣ 执行删除操作
         logger.info(f"🔄 准备删除包裹: {parcel_id}")
         success, result = delete_parcel(parcel_id)
         
         if success:
             logger.info(f"✅ 删除成功: {parcel_id}")
-            msg.body(f"✅ Success!\n{parcel_id} has been deleted.")
+            msg.body(f"✅ Success!\n📦 {parcel_id}\nhas been deleted.")
         else:
             error_msg = result.get('msg', result.get('error', 'Unknown error'))
             logger.error(f"❌ 删除失败: {error_msg}")
