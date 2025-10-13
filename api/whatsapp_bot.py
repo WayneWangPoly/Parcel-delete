@@ -2,9 +2,6 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import re, json, time, base64, logging, requests
 from Crypto.Cipher import AES
-from PIL import Image
-from pyzbar.pyzbar import decode
-from io import BytesIO
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -82,37 +79,45 @@ def extract_parcel_id(text: str) -> str:
         logger.info(f"✅ 匹配成功: {match.group(0)}")
         return match.group(0)
     else:
-        logger.info(f"❌ 匹配失败")
+        logger.info(f"❌ 文本匹配失败")
         return None
 
 def decode_qrcode_from_url(image_url: str) -> str:
-    """从图片URL下载并解析二维码"""
+    """使用在线 API 解析二维码"""
     try:
-        logger.info(f"📷 下载图片: {image_url}")
-        response = requests.get(image_url, timeout=10)
+        logger.info(f"📷 使用 API 解析二维码: {image_url}")
+        
+        # 使用 api.qrserver.com 免费 API
+        api_url = "https://api.qrserver.com/v1/read-qr-code/"
+        
+        # 方法1：直接传递图片 URL
+        response = requests.get(
+            api_url,
+            params={'fileurl': image_url},
+            timeout=15
+        )
         
         if response.status_code != 200:
-            logger.error(f"下载失败: {response.status_code}")
+            logger.error(f"API 请求失败: {response.status_code}")
             return None
         
-        # 打开图片
-        img = Image.open(BytesIO(response.content))
-        logger.info(f"图片大小: {img.size}, 模式: {img.mode}")
+        result = response.json()
+        logger.info(f"API 返回: {result}")
         
-        # 解析二维码
-        decoded_objects = decode(img)
-        logger.info(f"识别到 {len(decoded_objects)} 个二维码")
+        # 解析返回结果
+        if result and len(result) > 0:
+            symbol_data = result[0].get('symbol', [])
+            if symbol_data and len(symbol_data) > 0:
+                qr_data = symbol_data[0].get('data', '')
+                
+                if qr_data:
+                    logger.info(f"🔍 二维码内容: {qr_data}")
+                    # 从二维码内容中提取包裹号
+                    parcel_id = extract_parcel_id(qr_data)
+                    return parcel_id
         
-        if not decoded_objects:
-            return None
-        
-        # 获取第一个二维码的内容
-        qr_data = decoded_objects[0].data.decode('utf-8')
-        logger.info(f"🔍 二维码内容: {qr_data}")
-        
-        # 从二维码内容中提取包裹号
-        parcel_id = extract_parcel_id(qr_data)
-        return parcel_id
+        logger.warning("API 未能识别二维码")
+        return None
         
     except Exception as e:
         logger.error(f"二维码解析异常: {str(e)}", exc_info=True)
@@ -123,7 +128,7 @@ def health():
     return {
         "status": "ok",
         "service": "WhatsApp Parcel Delete Bot (Text + QR)",
-        "version": "2.0.0"
+        "version": "2.1.0"
     }
 
 @app.route("/api/whatsapp_bot", methods=["POST"])
@@ -154,7 +159,6 @@ def webhook():
         if num_media > 0 and media_url:
             if media_type.startswith('image/'):
                 logger.info("📷 检测到图片消息，尝试识别二维码...")
-                msg.body("🔍 Scanning QR code...")
                 
                 parcel_id = decode_qrcode_from_url(media_url)
                 
