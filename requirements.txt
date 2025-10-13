@@ -1,4 +1,6 @@
-flask
-twilio
-requests
-pycryptodome
+Flask==3.0.0
+twilio==8.10.0
+pycryptodome==3.19.0
+requests==2.31.0
+Pillow==10.1.0
+pyzbar==0.1.9
