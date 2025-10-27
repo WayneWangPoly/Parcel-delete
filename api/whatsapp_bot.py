@@ -71,12 +71,12 @@ def smart_extract_parcel_id(text: str) -> list:
     found_ids = []
     
     # 模式1：标准匹配 ME175 + 10位数字 + 3位字母数字
-    pattern1 = r'ME175\d{10}[A-Z0-9]{3}'
+    pattern1 = r'ME176\d{10}[A-Z0-9]{3}'
     matches1 = re.findall(pattern1, text)
     found_ids.extend(matches1)
     
     # 模式2：宽松匹配（允许中间10位有O）
-    pattern2 = r'ME175[0-9O]{10}[A-Z0-9]{3}'
+    pattern2 = r'ME176[0-9O]{10}[A-Z0-9]{3}'
     matches2 = re.findall(pattern2, text)
     for match in matches2:
         # 将中间10位的O替换为0
@@ -85,7 +85,7 @@ def smart_extract_parcel_id(text: str) -> list:
             found_ids.append(fixed)
     
     # 模式3：处理 ME 后的 I/l/1 混淆
-    pattern3 = r'ME[I1l]75[0-9O]{10}[A-Z0-9]{3}'
+    pattern3 = r'ME[I1l]76[0-9O]{10}[A-Z0-9]{3}'
     matches3 = re.findall(pattern3, text)
     for match in matches3:
         # ME 后必须是 1
