@@ -29,7 +29,7 @@ MAX_VARIANTS_PER_ID = 8
 # 环境变量
 TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '')
 TWILIO_AUTH_TOKEN  = os.environ.get('TWILIO_AUTH_TOKEN', '')
-TWILIO_WHATSAPP_FROM = os.environ.get('TWILIO_WHATSAPP_FROM', '')  # 例如 "whatsapp:+14155238886"
+TWILIO_WHATSAPP_FROM = whatsapp:+15558432115('TWILIO_WHATSAPP_FROM', '')  # 例如 "whatsapp:+14155238886"
 VERIFY_TWILIO_SIGNATURE = os.environ.get('VERIFY_TWILIO_SIGNATURE', '0') == '1'
 ASYNC_MODE = os.environ.get('ASYNC_MODE', '1') == '1'
 
