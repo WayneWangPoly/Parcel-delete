@@ -1,16 +1,19 @@
+# -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
-import re, json, time, base64, logging, requests, os, itertools, io, hmac, hashlib
+from twilio.request_validator import RequestValidator
+import re, json, time, base64, logging, requests, os, itertools, hmac, hashlib, uuid, threading
 from Crypto.Cipher import AES
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from collections import OrderedDict
+from typing import Optional, List
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("wa-bot")
 
-# ========== 配置 ==========
+# ========== Config ==========
 KEY = b"1236987410000111"
 IV  = b"1236987410000111"
 URL_BASE = "https://microexpress.com.au"
@@ -26,38 +29,60 @@ TIMEOUT = 15
 MAX_BATCH_SIZE = 20
 MAX_VARIANTS_PER_ID = 8
 
-# 环境变量
-TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '')
-TWILIO_AUTH_TOKEN  = os.environ.get('TWILIO_AUTH_TOKEN', '')
-TWILIO_WHATSAPP_FROM = whatsapp:+15558432115('TWILIO_WHATSAPP_FROM', '')  # 例如 "whatsapp:+14155238886"
-VERIFY_TWILIO_SIGNATURE = os.environ.get('VERIFY_TWILIO_SIGNATURE', '0') == '1'
-ASYNC_MODE = os.environ.get('ASYNC_MODE', '1') == '1'
-
-OCR_API_KEY = os.environ.get('OCR_API_KEY', 'K87899142388957')
+# Env
+TWILIO_ACCOUNT_SID     = os.environ.get('TWILIO_ACCOUNT_SID', '')
+TWILIO_AUTH_TOKEN      = os.environ.get('TWILIO_AUTH_TOKEN', '')
+TWILIO_WHATSAPP_FROM   = os.environ.get('TWILIO_WHATSAPP_FROM', '')  # e.g. "whatsapp:+14155238886"
+VERIFY_TWILIO_SIGNATURE= os.environ.get('VERIFY_TWILIO_SIGNATURE', '0') == '1'
+ASYNC_MODE             = os.environ.get('ASYNC_MODE', '1') == '1'
+OCR_API_KEY            = os.environ.get('OCR_API_KEY', 'K87899142388957')
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
-pool = ThreadPoolExecutor(max_workers=8)
+POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("WORKERS", "8")))
 
-# 字符映射表
+# ========== Dedup (MessageSid / Image hash) ==========
+class TTLDict(OrderedDict):
+    def __init__(self, ttl_seconds=86400, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ttl = ttl_seconds
+        self.lock = threading.Lock()
+    def set(self, k, v=True):
+        with self.lock:
+            now = time.time()
+            super().__setitem__(k, now + self.ttl)
+            # cleanup
+            for key, exp in list(self.items()):
+                if exp < now:
+                    super().__delitem__(key)
+    def has(self, k):
+        with self.lock:
+            exp = self.get(k)
+            if not exp:
+                return False
+            if exp < time.time():
+                try: super().__delitem__(k)
+                except: pass
+                return False
+            return True
+
+RECENT_SIDS   = TTLDict(ttl_seconds=24*3600)  # 24h
+RECENT_IMAGES = TTLDict(ttl_seconds=3600)     # 1h
+
+# ========== Char replacements & extraction ==========
 CHAR_REPLACEMENTS = {
-    'А': 'A', 'В': 'B', 'С': 'C', 'Е': 'E', 'Н': 'H',
-    'І': 'I', 'Ј': 'J', 'К': 'K', 'М': 'M', 'О': 'O',
-    'Р': 'P', 'Ѕ': 'S', 'Т': 'T', 'Х': 'X', 'У': 'Y',
-    'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c',
-    'х': 'x', 'у': 'y'
+    'А':'A','В':'B','С':'C','Е':'E','Н':'H','І':'I','Ј':'J','К':'K','М':'M','О':'O','Р':'P','Ѕ':'S','Т':'T','Х':'X','У':'Y',
+    'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y'
 }
 
-# ========== 工具函数 ==========
 def normalize_text(text: str) -> str:
-    for cyrillic, latin in CHAR_REPLACEMENTS.items():
-        text = text.replace(cyrillic, latin)
+    for k, v in CHAR_REPLACEMENTS.items():
+        text = text.replace(k, v)
     return text
 
 def fix_ocr_confusion(text: str) -> str:
-    text = normalize_text(text)
-    return text.upper()
+    return normalize_text(text).upper()
 
-def canonicalize_barcode(raw: str) -> str | None:
+def canonicalize_barcode(raw: str) -> Optional[str]:
     s = fix_ocr_confusion(raw)
     m = re.match(r'^ME([0-9OIL]{3})([0-9O]{10})([A-Z0-9O]{3})$', s)
     if not m:
@@ -69,22 +94,20 @@ def canonicalize_barcode(raw: str) -> str | None:
         return None
     return f"ME{series}{mid10}{last3}"
 
-def smart_extract_parcel_id(text: str) -> list[str]:
+def smart_extract_parcel_id(text: str) -> List[str]:
     text = fix_ocr_confusion(text)
     text = re.sub(r'\s+', '', text)
-    logger.info(f"🔍 文本抽取窗口: {text[:160]}...")
+    logger.info(f"[extract] sample: {text[:160]}...")
     candidates = re.findall(r'ME[0-9OIL]{3}[0-9O]{10}[A-Z0-9O]{3}', text)
     found = []
     for c in candidates:
         canon = canonicalize_barcode(c)
         if canon and canon not in found:
             found.append(canon)
-    if found:
-        logger.info(f"✅ 提取 {len(found)} 个ID: {found}")
-    else:
-        logger.info("❌ 未找到符合格式的ID")
+    logger.info(f"[extract] found {len(found)}: {found}")
     return found
 
+# ========== Crypto & HTTP ==========
 def pkcs7_pad(b: bytes, block_size=16) -> bytes:
     pad_len = block_size - (len(b) % block_size)
     return b + bytes([pad_len]) * pad_len
@@ -109,7 +132,7 @@ def http_post_json_with_retries(url: str, json_body: dict, headers: dict, timeou
         time.sleep(0.6 * i)
     return False, last or RuntimeError("post failed")
 
-def delete_parcel(barcode: str, reason_code=DEFAULT_REASON, address_type=DEFAULT_ADDRESS):
+def delete_parcel_once(barcode: str, reason_code=DEFAULT_REASON, address_type=DEFAULT_ADDRESS):
     try:
         payload = {
             "bar_code": barcode.strip().upper(),
@@ -117,9 +140,8 @@ def delete_parcel(barcode: str, reason_code=DEFAULT_REASON, address_type=DEFAULT
             "address_type": address_type,
             "myme_timestamp": int(time.time() * 1000)
         }
-        data_field = make_data_field(payload)
-        body = {"data": data_field}
-        url = URL_BASE + ENDPOINT
+        body = {"data": make_data_field(payload)}
+        url  = URL_BASE + ENDPOINT
         ok, resp = http_post_json_with_retries(url, body, HEADERS, TIMEOUT, max_retry=2)
         if ok:
             try:
@@ -132,54 +154,55 @@ def delete_parcel(barcode: str, reason_code=DEFAULT_REASON, address_type=DEFAULT
     except Exception as e:
         return False, {"error": str(e)}
 
-def expand_last3_variants(code: str) -> list[str]:
-    head = code[:-3]; tail = code[-3:]
-    if 'O' not in tail and '0' not in tail:
+def expand_last3_variants(code: str) -> List[str]:
+    head, tail = code[:-3], code[-3:]
+    pos = [i for i, ch in enumerate(tail) if ch in ('O','0')]
+    if not pos:
         return [code]
-    positions = [i for i,ch in enumerate(tail) if ch in ('O','0')]
     variants = {code}
-    limit = min(MAX_VARIANTS_PER_ID, 1 << len(positions))
+    limit = min(MAX_VARIANTS_PER_ID, 1 << len(pos))
     cnt = 0
-    for bits in itertools.product([0,1], repeat=len(positions)):
+    for bits in itertools.product([0,1], repeat=len(pos)):
         tl = list(tail)
         for idx, bit in enumerate(bits):
-            pos = positions[idx]
-            tl[pos] = '0' if bit == 0 else 'O'
+            tl[pos[idx]] = '0' if bit == 0 else 'O'
         variants.add(head + ''.join(tl))
         cnt += 1
         if cnt >= limit: break
-    return [v for v in variants]
+    return list(variants)
 
-def delete_parcel_with_variants(code: str, reason_code=DEFAULT_REASON, address_type=DEFAULT_ADDRESS):
+def delete_parcel_with_variants_retry(code: str, reason_code=DEFAULT_REASON, address_type=DEFAULT_ADDRESS):
     tried = []
-    for candidate in expand_last3_variants(code):
-        tried.append(candidate)
-        ok, result = delete_parcel(candidate, reason_code, address_type)
-        if ok:
-            return True, {"used": candidate, "result": result}
-    return False, {"tried": tried}
+    for cand in expand_last3_variants(code):
+        for attempt in range(1, 4):  # up to 3 attempts per candidate
+            ok, result = delete_parcel_once(cand, reason_code, address_type)
+            tried.append((cand, attempt, ok))
+            if ok:
+                return True, {"used": cand, "result": result, "attempt": attempt}
+            time.sleep(min(2**attempt, 5))
+    return False, {"tried": tried[-5:]}
 
-def download_twilio_media(media_url: str) -> bytes | None:
-    # 带认证 + 重试
+# ========== Media & OCR ==========
+def download_twilio_media(media_url: str) -> Optional[bytes]:
     last = None
     for i in range(1, 4):
         try:
             r = requests.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=15)
             if r.status_code == 200:
-                logger.info(f"✅ 媒体下载成功 {len(r.content)} bytes")
+                logger.info(f"[media] downloaded {len(r.content)} bytes")
                 return r.content
             else:
-                logger.warning(f"❌ 媒体下载失败 HTTP {r.status_code}")
+                logger.warning(f"[media] HTTP {r.status_code}")
         except Exception as e:
             last = e
-            logger.warning(f"媒体下载异常重试 {i}: {repr(e)}")
+            logger.warning(f"[media] retry {i} exception: {repr(e)}")
         time.sleep(0.5 * i)
-    logger.error(f"媒体下载最终失败: {repr(last)}")
+    logger.error(f"[media] failed: {repr(last)}")
     return None
 
-def ocr_image(image_bytes: bytes) -> str | None:
+def ocr_image(image_bytes: bytes) -> Optional[str]:
     try:
-        logger.info("📝 OCR 调用中...")
+        logger.info("[ocr] OCR.space")
         url = "https://api.ocr.space/parse/image"
         payload = {
             'apikey': OCR_API_KEY,
@@ -192,23 +215,23 @@ def ocr_image(image_bytes: bytes) -> str | None:
         files = {'file': ('image.jpg', image_bytes, 'image/jpeg')}
         r = requests.post(url, data=payload, files=files, timeout=30)
         if r.status_code != 200:
-            logger.error(f"OCR HTTP {r.status_code}")
+            logger.error(f"[ocr] HTTP {r.status_code}")
             return None
         result = r.json()
         if result.get('IsErroredOnProcessing'):
-            logger.error(f"OCR 处理错误: {result.get('ErrorMessage')}")
+            logger.error(f"[ocr] error: {result.get('ErrorMessage')}")
             return None
         pr = result.get('ParsedResults', [])
         if pr:
             text = pr[0].get('ParsedText', '')
-            logger.info(f"✅ OCR 文本长度: {len(text)}")
+            logger.info(f"[ocr] text length: {len(text)}")
             return text
         return None
     except Exception as e:
-        logger.error(f"OCR 异常: {str(e)}", exc_info=True)
+        logger.error(f"[ocr] exception: {str(e)}", exc_info=True)
         return None
 
-def decode_qrcode_goqr(image_bytes: bytes) -> str | None:
+def decode_qrcode_goqr(image_bytes: bytes) -> Optional[str]:
     try:
         url = "https://api.qrserver.com/v1/read-qr-code/"
         files = {'file': ('image.jpg', image_bytes, 'image/jpeg')}
@@ -221,51 +244,56 @@ def decode_qrcode_goqr(image_bytes: bytes) -> str | None:
             if symbol and len(symbol) > 0:
                 data = symbol[0].get('data')
                 if data:
-                    logger.info(f"✅ QR内容: {data[:100]}...")
+                    logger.info(f"[qr] sample: {data[:100]}...")
                     ids = smart_extract_parcel_id(data)
                     return ids[0] if ids else None
         return None
     except Exception as e:
-        logger.error(f"二维码识别异常: {str(e)}")
+        logger.error(f"[qr] exception: {str(e)}")
         return None
 
-def process_image(image_bytes: bytes) -> list[str]:
+def process_image(image_bytes: bytes) -> List[str]:
+    # QR first
     ids = []
-    logger.info("🔍 尝试二维码识别...")
     qr = decode_qrcode_goqr(image_bytes)
     if qr:
-        logger.info(f"✅ QR命中: {qr}")
-        return [qr]
-    logger.info("📝 二维码未命中，转 OCR...")
+        logger.info(f"[img] QR hit: {qr}")
+        ids.append(qr)
+        return ids
+    # OCR fallback
     txt = ocr_image(image_bytes)
     if txt:
-        res = smart_extract_parcel_id(txt)
-        if res:
-            logger.info(f"✅ OCR 提取 {len(res)} 个ID")
-            ids.extend(res)
+        ext = smart_extract_parcel_id(txt)
+        if ext:
+            ids.extend(ext)
         else:
-            logger.warning("⚠️ OCR 有文本但无ID")
+            logger.warning("[img] OCR has text but no IDs")
     else:
-        logger.warning("⚠️ OCR 失败")
+        logger.warning("[img] OCR failed")
     return ids
+
+# ========== Twilio helpers ==========
+def _external_url_for_signature(req):
+    proto = req.headers.get('X-Forwarded-Proto', req.scheme)
+    host  = req.headers.get('X-Forwarded-Host') or req.headers.get('Host')
+    path  = req.full_path if req.query_string else req.path
+    return f"{proto}://{host}{path}".rstrip('?')
 
 def verify_twilio_signature(req) -> bool:
     if not VERIFY_TWILIO_SIGNATURE or not TWILIO_AUTH_TOKEN:
         return True
-    sig = req.headers.get("X-Twilio-Signature", "")
-    # 构造基串：完整URL + 按参数名排序连接的值
-    url = request.url
+    validator = RequestValidator(TWILIO_AUTH_TOKEN)
+    url    = _external_url_for_signature(req)
     params = req.form.to_dict(flat=True)
-    s = url + "".join(v for _, v in sorted(params.items()))
-    digest = base64.b64encode(hmac.new(TWILIO_AUTH_TOKEN.encode(), s.encode(), hashlib.sha1).digest()).decode()
-    ok = hmac.compare_digest(sig, digest)
+    sig    = req.headers.get("X-Twilio-Signature", "")
+    ok = validator.validate(url, params, sig)
     if not ok:
-        logger.warning("Twilio Signature 校验失败")
+        logger.warning(f"[sig] failed url={url} sig={sig[:8]}...")
     return ok
 
 def send_followup_text(to_whatsapp: str, body: str):
     if not twilio_client or not TWILIO_WHATSAPP_FROM:
-        logger.warning("Twilio REST 未配置，无法发送跟进消息")
+        logger.warning("[followup] Twilio REST not configured, skip sending")
         return
     try:
         twilio_client.messages.create(
@@ -273,130 +301,155 @@ def send_followup_text(to_whatsapp: str, body: str):
             to=to_whatsapp,
             body=body
         )
-        logger.info("📤 已通过 Twilio REST 发送跟进消息")
+        logger.info("[followup] sent")
     except Exception as e:
-        logger.error(f"发送跟进消息失败: {repr(e)}")
+        logger.error(f"[followup] failed: {repr(e)}")
 
-# ========== 健康检查 ==========
+# ========== Health ==========
 @app.route("/api/whatsapp_bot", methods=["GET"])
 def health():
-    has_credentials = bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)
+    has_credentials = bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM)
     return {
         "status": "ok",
         "service": "WhatsApp Parcel Delete Bot",
-        "version": "5.0.0",
+        "version": "5.1.0",
         "twilio_configured": has_credentials,
         "async_mode": ASYNC_MODE,
         "max_batch_size": MAX_BATCH_SIZE,
         "features": [
-            "Ack-first async processing",
+            "Immediate ACK (English)",
+            "Async background processing",
+            "MessageSid idempotency (hook-ready)",
             "QR + OCR recognition",
-            "Variant retry for last-3 O/0",
-            "Batch & limits",
-            "Dedup-ready hooks",
-            "Twilio signature (optional)"
+            "O/0 tail variants with retry",
+            "RequestValidator signature check"
         ]
     }
 
-# ========== 主 Webhook ==========
-@app.route("/api/whatsapp_bot", methods=["POST"])
+# ========== Echo route (for quick self-test) ==========
+@app.post("/wa-echo")
+def wa_echo():
+    form = request.form.to_dict(flat=True)
+    body = (form.get("Body") or "").strip()
+    from_num = form.get("From", "")
+    num_media = int(form.get("NumMedia", "0") or "0")
+    resp = MessagingResponse()
+    if num_media > 0 and body:
+        resp.message(f"Echo: received {num_media} image(s) and text: {body[:120]}")
+    elif num_media > 0:
+        resp.message(f"Echo: received {num_media} image(s).")
+    elif body:
+        resp.message(f"Echo: received text: {body[:200]}")
+    else:
+        resp.message("Echo: empty message.")
+    return str(resp)
+
+# ========== Main webhook ==========
+@app.post("/api/whatsapp_bot")
 def webhook():
     if not verify_twilio_signature(request):
         return ("", 403)
 
-    # Twilio 使用 form-urlencoded；MessageSid 很关键
     form = request.values
     incoming_msg = (form.get("Body") or "").strip()
-    from_number = form.get("From", "")
-    num_media = int(form.get("NumMedia", 0))
-    message_sid = form.get("MessageSid", "")
-    logger.info(f"========= INBOUND =========")
-    logger.info(f"Sid={message_sid} From={from_number} Media={num_media} Body='{incoming_msg[:180]}'")
+    from_number  = form.get("From", "")
+    to_number    = form.get("To", "")
+    num_media    = int(form.get("NumMedia", 0))
+    message_sid  = form.get("MessageSid", "") or form.get("SmsSid", "")
 
-    # 先做轻量解析（不做网络IO），马上回执
+    req_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{req_id}] IN sid={message_sid} from={from_number} to={to_number} media={num_media} body='{incoming_msg}'")
+
+    # Idempotency: same MessageSid → ACK only
+    if message_sid and RECENT_SIDS.has(message_sid):
+        resp = MessagingResponse()
+        resp.message("Received (duplicate). Already processed.")
+        return str(resp)
+    if message_sid:
+        RECENT_SIDS.set(message_sid, True)
+
+    # Quick parse for immediate ACK (no network IO)
     quick_ids = smart_extract_parcel_id(incoming_msg) if incoming_msg else []
-    resp = MessagingResponse()
 
+    resp = MessagingResponse()
+    # English ACKs:
     if ASYNC_MODE:
-        # —— 异步模式：立即给用户一个明确的“已收到” —— #
         if num_media > 0 and quick_ids:
-            ack = f"✅ 收到文本ID {len(quick_ids)} 个，另有 {num_media} 张图片，正在处理…"
+            ack = f"Received {len(quick_ids)} text ID(s) and {num_media} image(s). Working on it…"
         elif num_media > 0:
-            ack = f"📸 收到 {num_media} 张图片，正在识别…"
+            ack = f"Received {num_media} image(s). Working on it…"
         elif quick_ids:
-            ack = f"✅ 收到 {len(quick_ids)} 个ID，正在处理…"
+            ack = f"Received {len(quick_ids)} ID(s). Working on it…"
         else:
-            ack = "👋 已收到你的消息，正在识别编号…（如有紧急，请直接发送形如 ME176XXXXXXXXXXABC 的文本）"
+            ack = "Message received. I’ll try to extract parcel IDs and get back to you soon."
         resp.message(ack)
-        # 提交后台处理
+        # background
         try:
-            pool.submit(background_process, dict(form))
+            POOL.submit(background_process, dict(form), req_id)
         except Exception as e:
-            logger.exception("后台任务提交失败")
+            logger.exception(f"[{req_id}] background submit failed: {e}")
         return str(resp)
     else:
-        # —— 同步模式：沿用你原本的“识别 + 删除 + 两条回复”的逻辑 —— #
-        return sync_pipeline(form, quick_ids)
+        # Fallback: sync pipeline (not recommended)
+        return sync_pipeline(form, quick_ids, req_id)
 
-def background_process(form_dict: dict):
-    """后台完整处理：下载媒体 -> QR/OCR -> 合并文本ID -> 限流 -> 变体删除 -> 通过 Twilio REST 回报告"""
+def background_process(form_dict: dict, req_id: str):
     try:
         from_number = form_dict.get("From", "")
-        num_media = int(form_dict.get("NumMedia", 0))
-        incoming_msg = (form_dict.get("Body") or "").strip()
+        num_media   = int(form_dict.get("NumMedia", 0))
+        incoming_msg= (form_dict.get("Body") or "").strip()
         message_sid = form_dict.get("MessageSid", "")
-        logger.info(f"[BG] Start Sid={message_sid}")
+        logger.info(f"[{req_id}] BG start sid={message_sid}")
 
         parcel_ids = set()
-        image_stats = []
+        stats = []
 
-        # 文字先抽
+        # text first
         if incoming_msg:
             ids = smart_extract_parcel_id(incoming_msg)
             if ids:
                 parcel_ids.update(ids)
-                image_stats.append(f"Text: ✅ Found {len(ids)}")
+                stats.append(f"Text: found {len(ids)}")
 
-        # 媒体识别
+        # media
         if num_media > 0:
-            logger.info(f"[BG] 处理 {num_media} 张图片")
             for i in range(num_media):
-                media_url = form_dict.get(f"MediaUrl{i}", "")
+                media_url  = form_dict.get(f"MediaUrl{i}", "")
                 media_type = form_dict.get(f"MediaContentType{i}", "")
                 if not media_url or not media_type.startswith("image/"):
-                    image_stats.append(f"Image {i+1}: ❌ Not image")
+                    stats.append(f"Image {i+1}: not an image")
                     continue
                 img = download_twilio_media(media_url)
                 if not img:
-                    image_stats.append(f"Image {i+1}: ❌ Download failed")
+                    stats.append(f"Image {i+1}: download failed")
                     continue
                 before = len(parcel_ids)
                 ids = process_image(img)
                 for pid in ids: parcel_ids.add(pid)
                 new_count = len(parcel_ids) - before
-                image_stats.append(f"Image {i+1}: {'✅' if new_count>0 else '⚠️'} Found {len(ids)} ({new_count} new)")
+                stats.append(f"Image {i+1}: {'found' if ids else 'no IDs'} ({new_count} new)")
 
         if not parcel_ids:
-            body = "❌ 未识别到可用的包裹号。\n建议：发送更清晰的截图或直接输入形如 ME176XXXXXXXXXXABC 的文本编号。"
-            send_followup_text(from_number, body)
-            logger.info(f"[BG] Sid={message_sid} 无ID，已通知用户")
+            send_followup_text(from_number,
+                "No valid parcel IDs were found.\n"
+                "Tip: send a clearer screenshot or type the ID like ME176XXXXXXXXXXABC.")
+            logger.info(f"[{req_id}] BG no IDs -> notified")
             return
 
         parcel_list = sorted(parcel_ids)
         if len(parcel_list) > MAX_BATCH_SIZE:
             preview = "\n".join([f"  • {p}" for p in parcel_list[:5]])
-            stats = "\n".join(image_stats) if image_stats else ""
-            body = (f"⚠️ IDs 过多：{len(parcel_list)}（上限 {MAX_BATCH_SIZE}）。\n\n"
-                    f"{stats}\n\n前5个：\n{preview}\n...\n请分批发送。")
-            send_followup_text(from_number, body)
-            logger.info(f"[BG] Sid={message_sid} 超量，已提示分批")
+            stats_txt = "\n".join(stats) if stats else "(no stats)"
+            send_followup_text(from_number,
+                f"Too many IDs: {len(parcel_list)} (max {MAX_BATCH_SIZE}).\n\n"
+                f"{stats_txt}\n\nFirst 5:\n{preview}\n...\nPlease split into smaller batches.")
+            logger.info(f"[{req_id}] BG too many IDs -> notified")
             return
 
-        # 删除
-        logger.info(f"[BG] 删除 {len(parcel_list)} 个：{parcel_list}")
+        # delete
         success, failed, used_variant = [], [], {}
         for pid in parcel_list:
-            ok, result = delete_parcel_with_variants(pid)
+            ok, result = delete_parcel_with_variants_retry(pid)
             if ok:
                 success.append(pid)
                 used = result.get("used", pid)
@@ -405,119 +458,117 @@ def background_process(form_dict: dict):
             else:
                 failed.append(pid)
 
-        # 汇总
-        summary = f"✅ {len(success)} deleted | ❌ {len(failed)} failed | 📦 {len(parcel_list)} total"
+        # report
+        summary = f"Total {len(parcel_list)} | Deleted {len(success)} | Failed {len(failed)}"
         lines = [summary, ""]
-        if image_stats:
-            lines.append("📊 Recognition Summary:")
-            lines.append("\n".join(image_stats))
+        if stats:
+            lines.append("Recognition summary:")
+            lines.extend(stats)
             lines.append("")
-
         if success:
-            lines.append(f"✅ Deleted ({len(success)}):")
-            show = success if len(success) <= 12 else success[:12] + [f"... and {len(success)-12} more"]
+            lines.append(f"Deleted ({len(success)}):")
+            show = success if len(success) <= 20 else success[:20] + [f"... and {len(success)-20} more"]
             for pid in show:
                 note = f" (used {used_variant[pid]})" if pid in used_variant else ""
                 lines.append(f"  • {pid}{note}")
-
         if failed:
             lines.append("")
-            lines.append(f"❌ Failed ({len(failed)}):")
-            showf = failed if len(failed) <= 8 else failed[:8] + [f"... and {len(failed)-8} more"]
+            lines.append(f"Failed ({len(failed)}):")
+            showf = failed if len(failed) <= 10 else failed[:10] + [f"... and {len(failed)-10} more"]
             for pid in showf:
                 lines.append(f"  • {pid}")
 
         send_followup_text(from_number, "\n".join(lines))
-        logger.info(f"[BG] 完成 Sid={message_sid}")
+        logger.info(f"[{req_id}] BG done")
     except Exception as e:
-        logger.exception(f"[BG] 致命异常：{repr(e)}")
+        logger.exception(f"[{req_id}] BG fatal: {e}")
+        try:
+            send_followup_text(form_dict.get("From",""), f"Background processing error: {repr(e)[:200]}")
+        except Exception:
+            pass
 
-def sync_pipeline(form, quick_ids):
-    """保留你的同步两条消息风格；当 ASYNC_MODE=0 时使用"""
+def sync_pipeline(form, quick_ids, req_id: str):
     try:
         incoming_msg = (form.get("Body") or "").strip()
-        from_number = form.get("From", "")
-        num_media = int(form.get("NumMedia", 0))
+        from_number  = form.get("From", "")
+        num_media    = int(form.get("NumMedia", 0))
 
         resp = MessagingResponse()
         parcel_ids = set()
-        image_stats = []
+        stats = []
 
         if incoming_msg and quick_ids:
             parcel_ids.update(quick_ids)
-            image_stats.append(f"Text: ✅ Found {len(quick_ids)}")
+            stats.append(f"Text: found {len(quick_ids)}")
 
         if num_media > 0:
             for i in range(num_media):
-                media_url = form.get(f"MediaUrl{i}", "")
+                media_url  = form.get(f"MediaUrl{i}", "")
                 media_type = form.get(f"MediaContentType{i}", "")
                 if not media_url or not media_type.startswith('image/'):
-                    image_stats.append(f"Image {i+1}: ❌ Not an image")
+                    stats.append(f"Image {i+1}: not an image")
                     continue
                 img = download_twilio_media(media_url)
                 if not img:
-                    image_stats.append(f"Image {i+1}: ❌ Download failed")
+                    stats.append(f"Image {i+1}: download failed")
                     continue
                 before = len(parcel_ids)
                 ids = process_image(img)
                 for pid in ids: parcel_ids.add(pid)
                 new_count = len(parcel_ids) - before
-                image_stats.append(f"Image {i+1}: {'✅' if new_count>0 else '⚠️'} Found {len(ids)} ({new_count} new)")
+                stats.append(f"Image {i+1}: {'found' if ids else 'no IDs'} ({new_count} new)")
 
         if not parcel_ids:
-            m = resp.message()
-            m.body("❌ No parcel IDs found!\n\nSend:\n• QR code photo\n• Screenshot with IDs\n• Or type: ME176XXXXXXXXXXABC")
+            resp.message("No parcel IDs found.\nSend a QR/photo with IDs, or type: ME176XXXXXXXXXXABC")
             return str(resp)
 
         parcel_list = sorted(parcel_ids)
-
         if len(parcel_list) > MAX_BATCH_SIZE:
-            stats_report = "\n".join(image_stats)
+            stats_report = "\n".join(stats)
             preview = '\n'.join([f"  • {p}" for p in parcel_list[:5]])
-            m = resp.message()
-            m.body(f"⚠️ Too many IDs! ({len(parcel_list)})\n\n{stats_report}\n\n"
-                   f"Max per batch: {MAX_BATCH_SIZE}\n\nFirst 5:\n{preview}\n...\n\nPlease split into smaller batches.")
+            resp.message(f"Too many IDs! ({len(parcel_list)})\n\n{stats_report}\n\n"
+                         f"Max per batch: {MAX_BATCH_SIZE}\n\nFirst 5:\n{preview}\n...\nPlease split into smaller batches.")
             return str(resp)
 
-        # 删除
-        success_list, failed_list, success_used_variant = [], [], {}
-        for parcel_id in parcel_list:
-            ok, result = delete_parcel_with_variants(parcel_id)
+        # delete
+        success, failed, used_variant = [], [], {}
+        for pid in parcel_list:
+            ok, result = delete_parcel_with_variants_retry(pid)
             if ok:
-                used = result.get("used", parcel_id)
-                success_list.append(parcel_id)
-                if used != parcel_id:
-                    success_used_variant[parcel_id] = used
+                used = result.get("used", pid)
+                success.append(pid)
+                if used != pid:
+                    used_variant[pid] = used
             else:
-                failed_list.append(parcel_id)
+                failed.append(pid)
 
-        # 第一条：概览
-        summary = f"✅ {len(success_list)} deleted | ❌ {len(failed_list)} failed | 📦 {len(parcel_list)} total"
+        # summary
+        summary = f"Deleted {len(success)} | Failed {len(failed)} | Total {len(parcel_list)}"
         resp.message(summary)
 
-        # 第二条：明细
-        report_lines = []
-        if image_stats:
-            report_lines.append("📊 Recognition Summary:")
-            report_lines.append("\n".join(image_stats))
-            report_lines.append("")
-        if success_list:
-            report_lines.append(f"✅ Deleted ({len(success_list)}):")
-            show = success_list if len(success_list) <= 10 else success_list[:10] + [f"... and {len(success_list)-10} more"]
+        # detail
+        lines = []
+        if stats:
+            lines.append("Recognition summary:")
+            lines.append("\n".join(stats))
+            lines.append("")
+        if success:
+            lines.append(f"Deleted ({len(success)}):")
+            show = success if len(success) <= 10 else success[:10] + [f"... and {len(success)-10} more"]
             for pid in show:
-                note = f" (used {success_used_variant[pid]})" if pid in success_used_variant else ""
-                report_lines.append(f"  • {pid}{note}")
-        if failed_list:
-            report_lines.append("")
-            report_lines.append(f"❌ Failed ({len(failed_list)}):")
-            showf = failed_list if len(failed_list) <= 5 else failed_list[:5] + [f"... and {len(failed_list)-5} more"]
+                note = f" (used {used_variant[pid]})" if pid in used_variant else ""
+                lines.append(f"  • {pid}{note}")
+        if failed:
+            lines.append("")
+            lines.append(f"Failed ({len(failed)}):")
+            showf = failed if len(failed) <= 5 else failed[:5] + [f"... and {len(failed)-5} more"]
             for pid in showf:
-                report_lines.append(f"  • {pid}")
-        resp.message("\n".join(report_lines) if report_lines else "No details.")
-
+                lines.append(f"  • {pid}")
+        resp.message("\n".join(lines) if lines else "No details.")
         return str(resp)
+
     except Exception as e:
-        logger.error(f"同步管线异常: {repr(e)}", exc_info=True)
+        logger.error(f"[{req_id}] sync fatal: {repr(e)}", exc_info=True)
         resp = MessagingResponse()
-        resp.message("❌ System error! Please try again later.")
+        resp.message("System error. Please try again later.")
         return str(resp)
