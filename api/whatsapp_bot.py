@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
 from twilio.request_validator import RequestValidator
@@ -32,18 +32,19 @@ MAX_BATCH_SIZE = 20
 MAX_VARIANTS_PER_ID = 8
 
 # Env
-TWILIO_ACCOUNT_SID      = os.environ.get("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN       = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_FROM    = "whatsapp:+15558432115"
+TWILIO_ACCOUNT_SID      = os.environ.get('TWILIO_ACCOUNT_SID', '').strip()
+TWILIO_AUTH_TOKEN       = os.environ.get('TWILIO_AUTH_TOKEN', '').strip()
+TWILIO_WHATSAPP_FROM    = os.environ.get('TWILIO_WHATSAPP_FROM', '').strip()  # e.g. "whatsapp:+15558432115"
 MESSAGING_SERVICE_SID   = os.environ.get('MESSAGING_SERVICE_SID', '').strip() # optional
 VERIFY_TWILIO_SIGNATURE = os.environ.get('VERIFY_TWILIO_SIGNATURE', '0') == '1'
 ASYNC_MODE              = os.environ.get('ASYNC_MODE', '1') == '1'
 OCR_API_KEY             = os.environ.get('OCR_API_KEY', 'K87899142388957').strip()
+WORKERS                 = int(os.environ.get('WORKERS', '8'))
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
-POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("WORKERS", "8")))
+POOL = ThreadPoolExecutor(max_workers=WORKERS)
 
-# ========== Dedup (MessageSid / Image hash, hooks ready) ==========
+# ========== Dedup ==========
 class TTLDict(OrderedDict):
     def __init__(self, ttl_seconds=86400, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -53,7 +54,6 @@ class TTLDict(OrderedDict):
         with self.lock:
             now = time.time()
             super().__setitem__(k, now + self.ttl)
-            # cleanup
             for key, exp in list(self.items()):
                 if exp < now:
                     super().__delitem__(key)
@@ -63,15 +63,15 @@ class TTLDict(OrderedDict):
             if not exp:
                 return False
             if exp < time.time():
-                try: super().__delitem__(key)
+                try: super().__delitem__(k)
                 except: pass
                 return False
             return True
 
-RECENT_SIDS   = TTLDict(ttl_seconds=24*3600)  # 24h
-RECENT_IMAGES = TTLDict(ttl_seconds=3600)     # 1h (hash hooks预留，当前未启用)
+RECENT_SIDS   = TTLDict(ttl_seconds=24*3600)
+RECENT_IMAGES = TTLDict(ttl_seconds=3600)  # 预留图片哈希去重
 
-# ========== Char replacements & extraction ==========
+# ========== Extract ==========
 CHAR_REPLACEMENTS = {
     'А':'A','В':'B','С':'C','Е':'E','Н':'H','І':'I','Ј':'J','К':'K','М':'M','О':'O','Р':'P','Ѕ':'S','Т':'T','Х':'X','У':'Y',
     'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y'
@@ -216,7 +216,8 @@ def ocr_image(image_bytes: bytes) -> Optional[str]:
             'OCREngine': 2
         }
         files = {'file': ('image.jpg', image_bytes, 'image/jpeg')}
-        r = requests.post(url, data=payload, files=files, timeout=30)
+        # 为适配无常驻函数，尽量把超时收敛
+        r = requests.post(url, data=payload, files=files, timeout=12)
         if r.status_code != 200:
             logger.error(f"[ocr] HTTP {r.status_code}")
             return None
@@ -238,7 +239,7 @@ def decode_qrcode_goqr(image_bytes: bytes) -> Optional[str]:
     try:
         url = "https://api.qrserver.com/v1/read-qr-code/"
         files = {'file': ('image.jpg', image_bytes, 'image/jpeg')}
-        r = requests.post(url, files=files, timeout=20)
+        r = requests.post(url, files=files, timeout=10)
         if r.status_code != 200:
             return None
         result = r.json()
@@ -319,23 +320,23 @@ def send_followup_text(to_whatsapp: str, body: str):
         logger.exception(f"[followup] Unexpected error: {repr(e)}")
 
 # ========== Health ==========
-@app.route("/api/whatsapp_bot", methods=["GET"])
+@app.get("/api/whatsapp_bot")
 def health():
     has_client = bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)
     sender = TWILIO_WHATSAPP_FROM or "(none)"
-    return {
+    return jsonify({
         "status": "ok",
         "service": "WhatsApp Parcel Delete Bot",
-        "version": "5.1.1",
+        "version": "5.2.0",
         "twilio_client": has_client,
         "sender": sender,
         "messaging_service_sid": MESSAGING_SERVICE_SID or "(none)",
         "verify_signature": VERIFY_TWILIO_SIGNATURE,
-        "async_mode": ASYNC_MODE,
+        "async_mode_env": ASYNC_MODE,
         "max_batch_size": MAX_BATCH_SIZE
-    }
+    })
 
-# ========== Echo route (quick self-test) ==========
+# ========== Echo（自测） ==========
 @app.post("/wa-echo")
 def wa_echo():
     form = request.form.to_dict(flat=True)
@@ -343,16 +344,16 @@ def wa_echo():
     num_media = int(form.get("NumMedia", "0") or "0")
     resp = MessagingResponse()
     if num_media > 0 and body:
-        resp.message(f"Echo: received {num_media} image(s) and text: {body[:120]}")
+        resp.message(f"🔁 Echo: {num_media} image(s) + text: {body[:120]}")
     elif num_media > 0:
-        resp.message(f"Echo: received {num_media} image(s).")
+        resp.message(f"🔁 Echo: {num_media} image(s).")
     elif body:
-        resp.message(f"Echo: received text: {body[:200]}")
+        resp.message(f"🔁 Echo: {body[:200]}")
     else:
-        resp.message("Echo: empty message.")
-    return str(resp)
+        resp.message("🔁 Echo: empty.")
+    return Response(str(resp), mimetype="application/xml")
 
-# ========== Main webhook ==========
+# ========== Webhook ==========
 @app.post("/api/whatsapp_bot")
 def webhook():
     if not verify_twilio_signature(request):
@@ -368,40 +369,44 @@ def webhook():
     req_id = str(uuid.uuid4())[:8]
     logger.info(f"[{req_id}] IN sid={message_sid} from={from_number} to={to_number} media={num_media} body='{incoming_msg}'")
 
-    # Idempotency: same MessageSid → ACK only
+    # Idempotency
     if message_sid and RECENT_SIDS.has(message_sid):
         resp = MessagingResponse()
-        resp.message("Received (duplicate). Already processed.")
-        return str(resp)
+        resp.message("⏱️ Received (duplicate). Already processed.")
+        return Response(str(resp), mimetype="application/xml")
     if message_sid:
         RECENT_SIDS.set(message_sid, True)
 
-    # Quick parse for immediate ACK (no network IO)
+    # Quick parse (no network IO)
     quick_ids = smart_extract_parcel_id(incoming_msg) if incoming_msg else []
 
-    resp = MessagingResponse()
-    # English ACKs:
-    if ASYNC_MODE:
+    # Vercel 强制同步
+    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host", "")
+    force_sync = "vercel.app" in host.lower()
+
+    if ASYNC_MODE and not force_sync:
+        # —— 异步模式（常驻环境时使用）——
+        resp = MessagingResponse()
         if num_media > 0 and quick_ids:
-            ack = f"Received {len(quick_ids)} text ID(s) and {num_media} image(s). Working on it…"
+            ack = f"✅ Received {len(quick_ids)} ID(s) and 🖼️ {num_media} image(s). Working on it…"
         elif num_media > 0:
-            ack = f"Received {num_media} image(s). Working on it…"
+            ack = f"🖼️ Received {num_media} image(s). Working on it…"
         elif quick_ids:
-            ack = f"Received {len(quick_ids)} ID(s). Working on it…"
+            ack = f"✅ Received {len(quick_ids)} ID(s). Working on it…"
         else:
-            ack = "Message received. I’ll try to extract parcel IDs and get back to you soon."
+            ack = "👋 Message received. I’ll try to extract parcel IDs and get back to you soon."
         resp.message(ack)
-        # background
         try:
             POOL.submit(background_process, dict(form), req_id)
         except Exception as e:
             logger.exception(f"[{req_id}] background submit failed: {e}")
-        return str(resp)
-    else:
-        # Fallback: sync pipeline (not recommended for media)
-        return sync_pipeline(form, quick_ids, req_id)
+        return Response(str(resp), mimetype="application/xml")
+
+    # —— 同步模式（或 Vercel 强制）——
+    return sync_pipeline(form, quick_ids, req_id)
 
 def background_process(form_dict: dict, req_id: str):
+    """仅在常驻环境使用；Vercel 会被回收。"""
     try:
         from_number = form_dict.get("From", "")
         num_media   = int(form_dict.get("NumMedia", 0))
@@ -412,14 +417,12 @@ def background_process(form_dict: dict, req_id: str):
         parcel_ids = set()
         stats = []
 
-        # text first
         if incoming_msg:
             ids = smart_extract_parcel_id(incoming_msg)
             if ids:
                 parcel_ids.update(ids)
                 stats.append(f"Text: found {len(ids)}")
 
-        # media
         if num_media > 0:
             for i in range(num_media):
                 media_url  = form_dict.get(f"MediaUrl{i}", "")
@@ -439,8 +442,8 @@ def background_process(form_dict: dict, req_id: str):
 
         if not parcel_ids:
             send_followup_text(from_number,
-                "No valid parcel IDs were found.\n"
-                "Tip: send a clearer screenshot or type the ID like ME176XXXXXXXXXXABC.")
+                "❌ No valid parcel IDs were found.\n"
+                "💡 Tip: send a clearer screenshot or type the ID like ME176XXXXXXXXXXABC.")
             logger.info(f"[{req_id}] BG no IDs -> notified")
             return
 
@@ -449,12 +452,11 @@ def background_process(form_dict: dict, req_id: str):
             preview = "\n".join([f"  • {p}" for p in parcel_list[:5]])
             stats_txt = "\n".join(stats) if stats else "(no stats)"
             send_followup_text(from_number,
-                f"Too many IDs: {len(parcel_list)} (max {MAX_BATCH_SIZE}).\n\n"
+                f"⚠️ Too many IDs: {len(parcel_list)} (max {MAX_BATCH_SIZE}).\n\n"
                 f"{stats_txt}\n\nFirst 5:\n{preview}\n...\nPlease split into smaller batches.")
             logger.info(f"[{req_id}] BG too many IDs -> notified")
             return
 
-        # delete
         success, failed, used_variant = [], [], {}
         for pid in parcel_list:
             ok, result = delete_parcel_with_variants_retry(pid)
@@ -466,22 +468,20 @@ def background_process(form_dict: dict, req_id: str):
             else:
                 failed.append(pid)
 
-        # report
-        summary = f"Total {len(parcel_list)} | Deleted {len(success)} | Failed {len(failed)}"
+        summary = f"📦 Total {len(parcel_list)} | ✅ Deleted {len(success)} | ❌ Failed {len(failed)}"
         lines = [summary, ""]
         if stats:
-            lines.append("Recognition summary:")
-            lines.extend(stats)
-            lines.append("")
+            lines.append("📊 Recognition summary:")
+            lines.extend(stats); lines.append("")
         if success:
-            lines.append(f"Deleted ({len(success)}):")
+            lines.append(f"✅ Deleted ({len(success)}):")
             show = success if len(success) <= 20 else success[:20] + [f"... and {len(success)-20} more"]
             for pid in show:
                 note = f" (used {used_variant[pid]})" if pid in used_variant else ""
                 lines.append(f"  • {pid}{note}")
         if failed:
             lines.append("")
-            lines.append(f"Failed ({len(failed)}):")
+            lines.append(f"❌ Failed ({len(failed)}):")
             showf = failed if len(failed) <= 10 else failed[:10] + [f"... and {len(failed)-10} more"]
             for pid in showf:
                 lines.append(f"  • {pid}")
@@ -491,22 +491,35 @@ def background_process(form_dict: dict, req_id: str):
     except Exception as e:
         logger.exception(f"[{req_id}] BG fatal: {e}")
         try:
-            send_followup_text(form_dict.get("From",""), f"Background processing error: {repr(e)[:200]}")
+            send_followup_text(form_dict.get("From",""), f"⚠️ Background processing error: {repr(e)[:200]}")
         except Exception:
             pass
 
 def sync_pipeline(form, quick_ids, req_id: str):
+    """同步：第一条先 ACK（英文+图标），随后同一响应里追加第二条“详细结果”消息。"""
     try:
         incoming_msg = (form.get("Body") or "").strip()
-        from_number  = form.get("From", "")
         num_media    = int(form.get("NumMedia", 0))
+        from_number  = form.get("From", "")
 
         resp = MessagingResponse()
-        parcel_ids = set()
+
+        # —— 第 1 条：即时 ACK —— #
+        if num_media > 0 and quick_ids:
+            ack = f"✅ Received {len(quick_ids)} ID(s) and 🖼️ {num_media} image(s). Working on it…"
+        elif num_media > 0:
+            ack = f"🖼️ Received {num_media} image(s). Working on it…"
+        elif quick_ids:
+            ack = f"✅ Received {len(quick_ids)} ID(s). Working on it…"
+        else:
+            ack = "👋 Message received. I’ll try to extract parcel IDs and get back to you soon."
+        resp.message(ack)
+
+        # —— 识别：文本 + 媒体 —— #
+        parcel_ids = set(quick_ids)
         stats = []
 
         if incoming_msg and quick_ids:
-            parcel_ids.update(quick_ids)
             stats.append(f"Text: found {len(quick_ids)}")
 
         if num_media > 0:
@@ -527,18 +540,23 @@ def sync_pipeline(form, quick_ids, req_id: str):
                 stats.append(f"Image {i+1}: {'found' if ids else 'no IDs'} ({new_count} new)")
 
         if not parcel_ids:
-            resp.message("No parcel IDs found.\nSend a QR/photo with IDs, or type: ME176XXXXXXXXXXABC")
-            return str(resp)
+            resp.message("❌ No parcel IDs found.\n💡 Send a QR/photo with IDs, or type: ME176XXXXXXXXXXABC")
+            logger.info(f"[{req_id}] sync ids=0 -> respond no IDs")
+            return Response(str(resp), mimetype="application/xml")
 
         parcel_list = sorted(parcel_ids)
         if len(parcel_list) > MAX_BATCH_SIZE:
             stats_report = "\n".join(stats)
             preview = '\n'.join([f"  • {p}" for p in parcel_list[:5]])
-            resp.message(f"Too many IDs! ({len(parcel_list)})\n\n{stats_report}\n\n"
-                         f"Max per batch: {MAX_BATCH_SIZE}\n\nFirst 5:\n{preview}\n...\nPlease split into smaller batches.")
-            return str(resp)
+            resp.message(
+                f"⚠️ Too many IDs! ({len(parcel_list)})\n\n{stats_report}\n\n"
+                f"Max per batch: {MAX_BATCH_SIZE}\n\nFirst 5:\n{preview}\n...\nPlease split into smaller batches."
+            )
+            logger.info(f"[{req_id}] sync too many ids={len(parcel_list)}")
+            return Response(str(resp), mimetype="application/xml")
 
-        # delete
+        # —— 删除 —— #
+        logger.info(f"[{req_id}] sync ids={list(parcel_list)}")
         success, failed, used_variant = [], [], {}
         for pid in parcel_list:
             ok, result = delete_parcel_with_variants_retry(pid)
@@ -549,47 +567,44 @@ def sync_pipeline(form, quick_ids, req_id: str):
                     used_variant[pid] = used
             else:
                 failed.append(pid)
+        logger.info(f"[{req_id}] sync result: deleted={len(success)} failed={len(failed)}")
 
-        # summary
-        summary = f"Deleted {len(success)} | Failed {len(failed)} | Total {len(parcel_list)}"
-        resp.message(summary)
-
-        # detail
-        lines = []
+        # —— 第 2 条：详细结果 —— #
+        summary = f"📦 Total {len(parcel_list)} | ✅ Deleted {len(success)} | ❌ Failed {len(failed)}"
+        lines = [summary, ""]
         if stats:
-            lines.append("Recognition summary:")
-            lines.append("\n".join(stats))
-            lines.append("")
+            lines.append("📊 Recognition summary:")
+            lines.append("\n".join(stats)); lines.append("")
         if success:
-            lines.append(f"Deleted ({len(success)}):")
-            show = success if len(success) <= 10 else success[:10] + [f"... and {len(success)-10} more"]
+            lines.append(f"✅ Deleted ({len(success)}):")
+            show = success if len(success) <= 12 else success[:12] + [f"... and {len(success)-12} more"]
             for pid in show:
                 note = f" (used {used_variant[pid]})" if pid in used_variant else ""
                 lines.append(f"  • {pid}{note}")
         if failed:
             lines.append("")
-            lines.append(f"Failed ({len(failed)}):")
-            showf = failed if len(failed) <= 5 else failed[:5] + [f"... and {len(failed)-5} more"]
+            lines.append(f"❌ Failed ({len(failed)}):")
+            showf = failed if len(failed) <= 8 else failed[:8] + [f"... and {len(failed)-8} more"]
             for pid in showf:
                 lines.append(f"  • {pid}")
-        resp.message("\n".join(lines) if lines else "No details.")
-        return str(resp)
+
+        resp.message("\n".join(lines))
+        return Response(str(resp), mimetype="application/xml")
 
     except Exception as e:
         logger.error(f"[{req_id}] sync fatal: {repr(e)}", exc_info=True)
         resp = MessagingResponse()
-        resp.message("System error. Please try again later.")
-        return str(resp)
+        resp.message("⚠️ System error. Please try again later.")
+        return Response(str(resp), mimetype="application/xml")
 
-# ========== Manual diag: send a WhatsApp to yourself ==========
+# ========== Manual diag（REST 自测） ==========
 @app.get("/diag/twilio")
 def diag_twilio():
-    """Open in browser: /diag/twilio?to=whatsapp:+61xxxxxxxxx"""
     to = request.args.get("to", "").strip()
     if not to:
         return jsonify(ok=False, error="provide ?to=whatsapp:+61xxxxxxxxx")
     try:
-        send_followup_text(to, "Twilio follow-up test: hello from bot.")
+        send_followup_text(to, "🔧 Twilio follow-up test: hello from bot.")
         return jsonify(ok=True, to=to,
                        via=MESSAGING_SERVICE_SID or TWILIO_WHATSAPP_FROM or "(none)")
     except Exception as e:
