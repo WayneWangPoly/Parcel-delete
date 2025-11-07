@@ -32,9 +32,9 @@ MAX_BATCH_SIZE = 20
 MAX_VARIANTS_PER_ID = 8
 
 # Env
-TWILIO_ACCOUNT_SID      = os.environ.get('TWILIO_ACCOUNT_SID', '').strip()
-TWILIO_AUTH_TOKEN       = os.environ.get('TWILIO_AUTH_TOKEN', '').strip()
-TWILIO_WHATSAPP_FROM    = os.environ.get('TWILIO_WHATSAPP_FROM', '').strip()  # e.g. "whatsapp:+14155238886"
+TWILIO_ACCOUNT_SID      = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN       = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_WHATSAPP_FROM    = "whatsapp:+15558432115"
 MESSAGING_SERVICE_SID   = os.environ.get('MESSAGING_SERVICE_SID', '').strip() # optional
 VERIFY_TWILIO_SIGNATURE = os.environ.get('VERIFY_TWILIO_SIGNATURE', '0') == '1'
 ASYNC_MODE              = os.environ.get('ASYNC_MODE', '1') == '1'
