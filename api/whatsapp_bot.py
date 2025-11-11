@@ -191,7 +191,6 @@ def verify_twilio_signature(req) -> bool:
     return ok
 
 def send_text(to_whatsapp: str, body: str):
-    """使用 Twilio REST 发送 WhatsApp 文本（用于即时 ACK 和处理结果）。"""
     if not twilio_client:
         log.warning("[twilio] REST client not configured")
         return
@@ -204,6 +203,12 @@ def send_text(to_whatsapp: str, body: str):
                 log.error("[twilio] Missing TWILIO_WHATSAPP_FROM")
                 return
             kwargs["from_"] = TWILIO_WHATSAPP_FROM
+
+        # ⬇️ 关键：让 Twilio 在状态变化时回调我们
+        cb = os.environ.get("STATUS_CALLBACK_URL", "").strip()
+        if cb:
+            kwargs["status_callback"] = cb
+
         msg = twilio_client.messages.create(**kwargs)
         log.info(f"[twilio] sent sid={msg.sid}")
     except TwilioRestException as e:
@@ -223,6 +228,19 @@ def health():
         "base": URL_BASE,
         "endpoint": ENDPOINT
     })
+
+@app.post("/twilio/status")
+def twilio_status():
+    data = request.values.to_dict(flat=True)
+    # 常见字段：MessageSid, MessageStatus, ErrorCode, ErrorMessage, To, From, SmsStatus ...
+    sid    = data.get("MessageSid") or data.get("SmsSid")
+    status = data.get("MessageStatus") or data.get("SmsStatus")
+    err    = data.get("ErrorCode")
+    emsg   = data.get("ErrorMessage")
+
+    log.info(f"[status] sid={sid} status={status} err={err} emsg={emsg} to={data.get('To')} from={data.get('From')}")
+    # 需要的话可写入 DB/文件。这里直接 200。
+    return ("", 200)
 
 # ===== 主 Webhook：REST 发两条消息（ACK + 结果），TwiML 空响应 =====
 @app.post("/api/whatsapp_bot")
