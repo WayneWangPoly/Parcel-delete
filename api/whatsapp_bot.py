@@ -12,7 +12,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("wa-bot-two-msg")
 
-# ===== 基本配置（可用环境变量覆盖） =====
+# ===== 基本配置（可被环境变量覆盖） =====
 KEY = os.environ.get("AES_KEY", "1236987410000111").encode()
 IV  = os.environ.get("AES_IV",  "1236987410000111").encode()
 URL_BASE  = os.environ.get("API_BASE", "https://microexpress.com.au")
@@ -20,8 +20,8 @@ ENDPOINT  = os.environ.get("API_DELETE", "/smydriver/delete-sudo-parcel")
 HEADERS   = {"Content-Type": "application/json;UTF-8", "User-Agent": "Mozilla/5.0", "Accept-Language": "en-AU,en;q=0.9"}
 DEFAULT_REASON  = "NOREASON"
 DEFAULT_ADDRESS = "house"
-HTTP_TIMEOUT    = 10            # 后端 API 超时
-OCR_TIMEOUT     = 10            # OCR 超时（serverless 友好）
+HTTP_TIMEOUT    = 10
+OCR_TIMEOUT     = 10
 MAX_BATCH_SIZE  = 20
 MAX_VARIANTS    = 8
 
@@ -31,7 +31,7 @@ TWILIO_AUTH_TOKEN    = os.environ.get("TWILIO_AUTH_TOKEN",  "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()  # e.g. whatsapp:+15558432115
 VERIFY_TWILIO_SIGNATURE = os.environ.get("VERIFY_TWILIO_SIGNATURE", "0") == "1"
 OCR_API_KEY = os.environ.get("OCR_API_KEY", "K87899142388957").strip()
-STATUS_CALLBACK_URL = os.environ.get("STATUS_CALLBACK_URL", "").strip()  # 建议设为 https://<你的域名>/api/whatsapp_bot
+STATUS_CALLBACK_URL = os.environ.get("STATUS_CALLBACK_URL", "").strip()    # 建议设为 https://<域名>/api/whatsapp_bot
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
 
@@ -77,7 +77,7 @@ def pkcs7_pad(b: bytes, bs=16) -> bytes:
     return b + bytes([pad])*pad
 
 def make_data_field(payload: dict) -> str:
-    from Crypto.Cipher import AES  # 延迟导入防止环境缺库即崩
+    from Crypto.Cipher import AES  # 延迟导入，防止无库时导入期即崩
     cipher = AES.new(KEY, AES.MODE_CBC, IV)
     ct = cipher.encrypt(pkcs7_pad(json.dumps(payload, separators=(',',':')).encode()))
     return base64.b64encode(ct).decode()
@@ -192,44 +192,37 @@ def verify_twilio_signature(req) -> bool:
     if not ok: log.warning(f"[sig] failed url={url}")
     return ok
 
-# ===== 发送（强制 from_，并用入站号码兜底纠错） =====
+# ===== 发送（强制收件人为入站 From；不使用 Messaging Service） =====
 def send_text(to_whatsapp: str, body: str, inbound_from_ctx: str = ""):
-    """发送到用户号码。inbound_from_ctx 用于防呆：若误把机器人号码当收件人，自动改回入站 From。"""
+    """强制把消息发回入站 From（用户号码）。忽略任何错误传入的 to。"""
     if not twilio_client:
         log.warning("[twilio] REST client not configured")
         return
     try:
-        to_whatsapp = normalize_wa(to_whatsapp)
-        inbound_from_ctx = normalize_wa(inbound_from_ctx)
+        def norm(num: str) -> str:
+            num = (num or "").strip()
+            return num if num.startswith("whatsapp:") else f"whatsapp:{num}" if num else num
 
-        if not to_whatsapp:
-            log.error("[twilio] empty recipient")
+        to_final   = norm(inbound_from_ctx) or norm(to_whatsapp)
+        from_final = norm(TWILIO_WHATSAPP_FROM)
+
+        if not to_final:
+            log.error("[twilio] empty recipient (no inbound_from_ctx and no to)")
             return
-
-        # 🚨 防呆：若 to 错等于我们的发信号码，自动纠正成入站 From（若可用），否则拒发
-        if TWILIO_WHATSAPP_FROM and to_whatsapp == TWILIO_WHATSAPP_FROM:
-            if inbound_from_ctx and inbound_from_ctx != TWILIO_WHATSAPP_FROM:
-                log.warning(f"[twilio] detected TO=our SENDER ({to_whatsapp}); auto-correct -> {inbound_from_ctx}")
-                to_whatsapp = inbound_from_ctx
-            else:
-                log.error(f"[twilio] TO equals our SENDER ({to_whatsapp}) and no valid inbound ctx — abort send.")
-                return
-
-        if not TWILIO_WHATSAPP_FROM:
+        if not from_final:
             log.error("[twilio] Missing TWILIO_WHATSAPP_FROM")
             return
+        if to_final == from_final:
+            log.error(f"[twilio] to==from ({to_final}). Refuse to send to ourselves.")
+            return
 
-        kwargs = {
-            "to": to_whatsapp,
-            "from_": TWILIO_WHATSAPP_FROM,   # 不使用 Messaging Service，显式 from_
-            "body": body
-        }
+        kwargs = {"to": to_final, "from_": from_final, "body": body}
         if STATUS_CALLBACK_URL:
             kwargs["status_callback"] = STATUS_CALLBACK_URL
 
-        log.info(f"[twilio] creating message to={to_whatsapp} from={TWILIO_WHATSAPP_FROM} body_len={len(body)}")
+        log.info(f"[twilio] creating message to={kwargs['to']} from={kwargs['from_']} body_len={len(body)}")
         msg = twilio_client.messages.create(**kwargs)
-        log.info(f"[twilio] sent sid={msg.sid} to={to_whatsapp} from={TWILIO_WHATSAPP_FROM}")
+        log.info(f"[twilio] sent sid={msg.sid} to={kwargs['to']} from={kwargs['from_']}")
     except TwilioRestException as e:
         log.error(f"[twilio] status={getattr(e,'status',None)} code={getattr(e,'code',None)} msg={getattr(e,'msg',str(e))}")
     except Exception as e:
@@ -240,7 +233,7 @@ def send_text(to_whatsapp: str, body: str, inbound_from_ctx: str = ""):
 def health():
     return jsonify({
         "status":"ok",
-        "version":"two-msg-1.2-nosvc",
+        "version":"two-msg-1.3-forced-inbound",
         "twilio_from": TWILIO_WHATSAPP_FROM or "(none)",
         "verify_sig": VERIFY_TWILIO_SIGNATURE,
         "base": URL_BASE,
