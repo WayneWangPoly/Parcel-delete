@@ -4,13 +4,9 @@ from typing import Optional, List
 from flask import Flask, request, jsonify, Response
 
 # Twilio（REST 发送 & 验签）
-from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
 from twilio.request_validator import RequestValidator
 from twilio.base.exceptions import TwilioRestException
-
-# AES 延迟导入在函数里做，避免导入期崩溃
-# from Crypto.Cipher import AES
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -33,13 +29,14 @@ MAX_VARIANTS    = 8
 TWILIO_ACCOUNT_SID   = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN    = os.environ.get("TWILIO_AUTH_TOKEN",  "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()  # e.g. whatsapp:+15558432115
-MESSAGING_SERVICE_SID= os.environ.get("MESSAGING_SERVICE_SID", "").strip() # 可选
+MESSAGING_SERVICE_SID= os.environ.get("MESSAGING_SERVICE_SID", "").strip() # 可选（更推荐）
 VERIFY_TWILIO_SIGNATURE = os.environ.get("VERIFY_TWILIO_SIGNATURE", "0") == "1"
 OCR_API_KEY = os.environ.get("OCR_API_KEY", "K87899142388957").strip()
+STATUS_CALLBACK_URL = os.environ.get("STATUS_CALLBACK_URL", "").strip()  # 建议= https://<你的域名>/api/whatsapp_bot
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
 
-# ===== 文本抽取 =====
+# ===== 工具函数 =====
 CHAR_REPL = {
     'А':'A','В':'B','С':'C','Е':'E','Н':'H','І':'I','Ј':'J','К':'K','М':'M','О':'O','Р':'P','Ѕ':'S','Т':'T','Х':'X','У':'Y',
     'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y'
@@ -75,13 +72,13 @@ def extract_ids(text: str) -> List[str]:
     log.info(f"[extract] found {len(out)}: {out}")
     return out
 
-# ===== 加密 & 后端调用 =====
 def pkcs7_pad(b: bytes, bs=16) -> bytes:
     pad = bs - (len(b) % bs)
     return b + bytes([pad])*pad
 
 def make_data_field(payload: dict) -> str:
-    from Crypto.Cipher import AES  # 延迟导入，避免无库直接崩
+    # 延迟导入，避免无库直接崩
+    from Crypto.Cipher import AES
     cipher = AES.new(KEY, AES.MODE_CBC, IV)
     ct = cipher.encrypt(pkcs7_pad(json.dumps(payload, separators=(',',':')).encode()))
     return base64.b64encode(ct).decode()
@@ -132,7 +129,6 @@ def delete_with_variants(code: str):
             return True, {"used": cand, "result": res}
     return False, {"tried": tried}
 
-# ===== 媒体 & OCR =====
 def dl_media(url: str) -> Optional[bytes]:
     try:
         r = requests.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=8)
@@ -152,11 +148,11 @@ def ocr_space(img: bytes) -> Optional[str]:
             files={'file': ('image.jpg', img, 'image/jpeg')},
             timeout=OCR_TIMEOUT
         )
-        if r.status_code!=200: 
+        if r.status_code!=200:
             log.warning(f"[ocr] http {r.status_code}")
             return None
         js = r.json()
-        if js.get("IsErroredOnProcessing"): 
+        if js.get("IsErroredOnProcessing"):
             log.warning(f"[ocr] error {js.get('ErrorMessage')}")
             return None
         pr = js.get("ParsedResults", [])
@@ -170,11 +166,16 @@ def ocr_space(img: bytes) -> Optional[str]:
         return None
 
 def process_image(img: bytes) -> List[str]:
-    # 直接走 OCR（二维码可按需再加）
     text = ocr_space(img)
     return extract_ids(text or "") if text else []
 
-# ===== Twilio 帮助函数 =====
+def normalize_wa(num: str) -> str:
+    """确保是 whatsapp:+E164 的形式；若已是 whatsapp: 前缀则原样保留。"""
+    num = (num or "").strip()
+    if not num:
+        return num
+    return num if num.startswith("whatsapp:") else f"whatsapp:{num}"
+
 def verify_twilio_signature(req) -> bool:
     if not VERIFY_TWILIO_SIGNATURE or not TWILIO_AUTH_TOKEN:
         return True
@@ -191,26 +192,40 @@ def verify_twilio_signature(req) -> bool:
     return ok
 
 def send_text(to_whatsapp: str, body: str):
+    """仅发送到“入站 From（用户号码）”。多人并发安全：每次 webhook 独立传入收件人。"""
     if not twilio_client:
         log.warning("[twilio] REST client not configured")
         return
     try:
+        to_whatsapp = normalize_wa(to_whatsapp)
+        if not to_whatsapp:
+            log.error("[twilio] empty recipient")
+            return
+
+        # 防呆：严禁把自己号码当收件人
+        if TWILIO_WHATSAPP_FROM and to_whatsapp == TWILIO_WHATSAPP_FROM:
+            log.error(f"[twilio] TO equals our SENDER ({to_whatsapp}) — abort send.")
+            return
+
         kwargs = {"to": to_whatsapp, "body": body}
+
         if MESSAGING_SERVICE_SID:
             kwargs["messaging_service_sid"] = MESSAGING_SERVICE_SID
+            send_from = f"MS:{MESSAGING_SERVICE_SID}"
         else:
             if not TWILIO_WHATSAPP_FROM:
                 log.error("[twilio] Missing TWILIO_WHATSAPP_FROM")
                 return
             kwargs["from_"] = TWILIO_WHATSAPP_FROM
+            send_from = TWILIO_WHATSAPP_FROM
 
-        # ⬇️ 关键：让 Twilio 在状态变化时回调我们
-        cb = os.environ.get("STATUS_CALLBACK_URL", "").strip()
-        if cb:
-            kwargs["status_callback"] = cb
+        if STATUS_CALLBACK_URL:
+            kwargs["status_callback"] = STATUS_CALLBACK_URL
 
+        # 关键日志：每条都打印 to/from，方便你在 Console 核对
+        log.info(f"[twilio] creating message to={to_whatsapp} from={send_from} body_len={len(body)}")
         msg = twilio_client.messages.create(**kwargs)
-        log.info(f"[twilio] sent sid={msg.sid}")
+        log.info(f"[twilio] sent sid={msg.sid} to={to_whatsapp} from={send_from}")
     except TwilioRestException as e:
         log.error(f"[twilio] status={getattr(e,'status',None)} code={getattr(e,'code',None)} msg={getattr(e,'msg',str(e))}")
     except Exception as e:
@@ -221,58 +236,56 @@ def send_text(to_whatsapp: str, body: str):
 def health():
     return jsonify({
         "status":"ok",
-        "version":"two-msg-1.0",
+        "version":"two-msg-1.1",
         "twilio_from": TWILIO_WHATSAPP_FROM or "(none)",
         "msvc": MESSAGING_SERVICE_SID or "(none)",
         "verify_sig": VERIFY_TWILIO_SIGNATURE,
         "base": URL_BASE,
-        "endpoint": ENDPOINT
+        "endpoint": ENDPOINT,
+        "status_callback": STATUS_CALLBACK_URL or "(none)"
     })
 
+# 单独给 Twilio 用的状态回执（可选；更推荐统一回到 /api/whatsapp_bot）
 @app.post("/twilio/status")
 def twilio_status():
-    data = request.values.to_dict(flat=True)
-    # 常见字段：MessageSid, MessageStatus, ErrorCode, ErrorMessage, To, From, SmsStatus ...
-    sid    = data.get("MessageSid") or data.get("SmsSid")
-    status = data.get("MessageStatus") or data.get("SmsStatus")
-    err    = data.get("ErrorCode")
-    emsg   = data.get("ErrorMessage")
-
-    log.info(f"[status] sid={sid} status={status} err={err} emsg={emsg} to={data.get('To')} from={data.get('From')}")
-    # 需要的话可写入 DB/文件。这里直接 200。
+    f = request.values
+    sid    = f.get("MessageSid") or f.get("SmsSid")
+    status = f.get("MessageStatus") or f.get("SmsStatus")
+    err    = f.get("ErrorCode")
+    emsg   = f.get("ErrorMessage")
+    to_    = f.get("To"); from_ = f.get("From")
+    direction = "outbound" if (sid or "").startswith("SM") else "inbound"
+    log.info(f"[status][{direction}] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
     return ("", 200)
 
-# ===== 主 Webhook：REST 发两条消息（ACK + 结果），TwiML 空响应 =====
+# ===== 主 Webhook：同一路径既收入站消息也收状态回执 =====
 @app.post("/api/whatsapp_bot")
 def webhook():
-    # 如果你开启了签名校验，这里同样适用于回执请求
     if not verify_twilio_signature(request):
         return ("", 403)
 
     form = request.values
 
     # === ① Twilio 消息状态回执（与入站消息共用同一 URL） ===
-    # Status Callback 会带这些字段：MessageSid / SmsSid、MessageStatus / SmsStatus、ErrorCode、ErrorMessage ...
     if form.get("MessageStatus") or form.get("SmsStatus"):
         sid    = form.get("MessageSid") or form.get("SmsSid")
         status = form.get("MessageStatus") or form.get("SmsStatus")
         err    = form.get("ErrorCode")
         emsg   = form.get("ErrorMessage")
-        to_    = form.get("To")
-        from_  = form.get("From")
-        log.info(f"[status] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
-        # 别向用户回消息；只回 200 即可
+        to_    = form.get("To"); from_ = form.get("From")
+        direction = "outbound" if (sid or "").startswith("SM") else "inbound"
+        log.info(f"[status][{direction}] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
         return ("", 200)
 
-    # === ② 以下才是“入站 WhatsApp 消息”处理 ===
-    from_number = form.get("From","")
+    # === ② 入站消息：每次请求独立处理（多人并发互不干扰） ===
+    inbound_from = normalize_wa(form.get("From",""))       # 用户号码（收件人to）
     nmed = int(form.get("NumMedia", 0))
     body = (form.get("Body") or "").strip()
     sid  = form.get("MessageSid","") or form.get("SmsSid","")
     rid  = str(uuid.uuid4())[:8]
-    log.info(f"[{rid}] IN sid={sid} from={from_number} media={nmed} body='{body[:100]}'")
+    log.info(f"[{rid}] IN sid={sid} from={inbound_from} media={nmed} body='{body[:100]}'")
 
-    # ① 立刻发送英文 ACK（第一条）
+    # ① 立刻英文 ACK（第一条）
     if nmed > 0 and body:
         ack = f"✅ Received your text and 🖼️ {nmed} image(s). Working on it…"
     elif nmed > 0:
@@ -281,9 +294,9 @@ def webhook():
         ack = f"✅ Received your message. Working on it…"
     else:
         ack = "👋 Message received. Working on it…"
-    send_text(from_number, ack)
+    send_text(inbound_from, ack)
 
-    # ② 同步完成识别 + 删除，然后发送结果（第二条）
+    # ② 识别 + 删除 → 结果（第二条）
     ids = extract_ids(body) if body else []
     stats = []
     if nmed>0:
@@ -302,13 +315,13 @@ def webhook():
             stats.append(f"Image {i+1}: {'found' if got else 'no IDs'} (+{len(ids)-before})")
 
     if not ids:
-        send_text(from_number, "❌ No parcel IDs found.\n💡 Send a clear screenshot or type: ME176XXXXXXXXXXABC")
+        send_text(inbound_from, "❌ No parcel IDs found.\n💡 Send a clear screenshot or type: ME176XXXXXXXXXXABC")
         return Response("<Response/>", mimetype="application/xml")
 
     if len(ids) > MAX_BATCH_SIZE:
         preview = "\n".join([f"  • {x}" for x in ids[:5]])
         stattxt = "\n".join(stats) if stats else ""
-        send_text(from_number,
+        send_text(inbound_from,
                   f"⚠️ Too many IDs: {len(ids)} (max {MAX_BATCH_SIZE}).\n{stattxt}\n\nFirst 5:\n{preview}\n...\nPlease split into smaller batches.")
         return Response("<Response/>", mimetype="application/xml")
 
@@ -337,8 +350,5 @@ def webhook():
         for f in showf:
             lines.append(f"  • {f}")
 
-    send_text(from_number, "\n".join(lines))
-    return Response("<Response/>", mimetype="application/xml")
-
-    # ③ 返回空 TwiML（避免 Twilio 再发一条）
+    send_text(inbound_from, "\n".join(lines))
     return Response("<Response/>", mimetype="application/xml")
