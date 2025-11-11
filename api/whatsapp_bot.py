@@ -229,7 +229,7 @@ def health():
         "endpoint": ENDPOINT
     })
 
-@app.post("/twilio/status")
+@app.post("/api/twilio/status")
 def twilio_status():
     data = request.values.to_dict(flat=True)
     # 常见字段：MessageSid, MessageStatus, ErrorCode, ErrorMessage, To, From, SmsStatus ...
