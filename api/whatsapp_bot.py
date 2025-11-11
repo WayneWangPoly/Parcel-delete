@@ -12,7 +12,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("wa-bot-two-msg")
 
-# ===== 基本配置 =====
+# ===== 基本配置（可用环境变量覆盖） =====
 KEY = os.environ.get("AES_KEY", "1236987410000111").encode()
 IV  = os.environ.get("AES_IV",  "1236987410000111").encode()
 URL_BASE  = os.environ.get("API_BASE", "https://microexpress.com.au")
@@ -25,18 +25,17 @@ OCR_TIMEOUT     = 10            # OCR 超时（serverless 友好）
 MAX_BATCH_SIZE  = 20
 MAX_VARIANTS    = 8
 
-# 环境变量（Twilio）
+# ===== Twilio 配置（不使用 Messaging Service） =====
 TWILIO_ACCOUNT_SID   = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN    = os.environ.get("TWILIO_AUTH_TOKEN",  "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()  # e.g. whatsapp:+15558432115
-MESSAGING_SERVICE_SID= os.environ.get("MESSAGING_SERVICE_SID", "").strip() # 可选（更推荐）
 VERIFY_TWILIO_SIGNATURE = os.environ.get("VERIFY_TWILIO_SIGNATURE", "0") == "1"
 OCR_API_KEY = os.environ.get("OCR_API_KEY", "K87899142388957").strip()
-STATUS_CALLBACK_URL = os.environ.get("STATUS_CALLBACK_URL", "").strip()  # 建议= https://<你的域名>/api/whatsapp_bot
+STATUS_CALLBACK_URL = os.environ.get("STATUS_CALLBACK_URL", "").strip()  # 建议设为 https://<你的域名>/api/whatsapp_bot
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
 
-# ===== 工具函数 =====
+# ===== 文本抽取辅助 =====
 CHAR_REPL = {
     'А':'A','В':'B','С':'C','Е':'E','Н':'H','І':'I','Ј':'J','К':'K','М':'M','О':'O','Р':'P','Ѕ':'S','Т':'T','Х':'X','У':'Y',
     'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y'
@@ -72,13 +71,13 @@ def extract_ids(text: str) -> List[str]:
     log.info(f"[extract] found {len(out)}: {out}")
     return out
 
+# ===== AES & 调后端删除 =====
 def pkcs7_pad(b: bytes, bs=16) -> bytes:
     pad = bs - (len(b) % bs)
     return b + bytes([pad])*pad
 
 def make_data_field(payload: dict) -> str:
-    # 延迟导入，避免无库直接崩
-    from Crypto.Cipher import AES
+    from Crypto.Cipher import AES  # 延迟导入防止环境缺库即崩
     cipher = AES.new(KEY, AES.MODE_CBC, IV)
     ct = cipher.encrypt(pkcs7_pad(json.dumps(payload, separators=(',',':')).encode()))
     return base64.b64encode(ct).decode()
@@ -129,6 +128,7 @@ def delete_with_variants(code: str):
             return True, {"used": cand, "result": res}
     return False, {"tried": tried}
 
+# ===== 媒体 & OCR =====
 def dl_media(url: str) -> Optional[bytes]:
     try:
         r = requests.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=8)
@@ -169,8 +169,9 @@ def process_image(img: bytes) -> List[str]:
     text = ocr_space(img)
     return extract_ids(text or "") if text else []
 
+# ===== 通用 =====
 def normalize_wa(num: str) -> str:
-    """确保是 whatsapp:+E164 的形式；若已是 whatsapp: 前缀则原样保留。"""
+    """确保是 whatsapp:+E164；已带前缀则原样。"""
     num = (num or "").strip()
     if not num:
         return num
@@ -180,7 +181,7 @@ def verify_twilio_signature(req) -> bool:
     if not VERIFY_TWILIO_SIGNATURE or not TWILIO_AUTH_TOKEN:
         return True
     validator = RequestValidator(TWILIO_AUTH_TOKEN)
-    # Vercel 反代：使用外部可见 URL
+    # 反代下使用外部可见 URL
     proto = req.headers.get('X-Forwarded-Proto', req.scheme)
     host  = req.headers.get('X-Forwarded-Host') or req.headers.get('Host')
     path  = req.full_path if req.query_string else req.path
@@ -191,41 +192,44 @@ def verify_twilio_signature(req) -> bool:
     if not ok: log.warning(f"[sig] failed url={url}")
     return ok
 
-def send_text(to_whatsapp: str, body: str):
-    """仅发送到“入站 From（用户号码）”。多人并发安全：每次 webhook 独立传入收件人。"""
+# ===== 发送（强制 from_，并用入站号码兜底纠错） =====
+def send_text(to_whatsapp: str, body: str, inbound_from_ctx: str = ""):
+    """发送到用户号码。inbound_from_ctx 用于防呆：若误把机器人号码当收件人，自动改回入站 From。"""
     if not twilio_client:
         log.warning("[twilio] REST client not configured")
         return
     try:
         to_whatsapp = normalize_wa(to_whatsapp)
+        inbound_from_ctx = normalize_wa(inbound_from_ctx)
+
         if not to_whatsapp:
             log.error("[twilio] empty recipient")
             return
 
-        # 防呆：严禁把自己号码当收件人
+        # 🚨 防呆：若 to 错等于我们的发信号码，自动纠正成入站 From（若可用），否则拒发
         if TWILIO_WHATSAPP_FROM and to_whatsapp == TWILIO_WHATSAPP_FROM:
-            log.error(f"[twilio] TO equals our SENDER ({to_whatsapp}) — abort send.")
+            if inbound_from_ctx and inbound_from_ctx != TWILIO_WHATSAPP_FROM:
+                log.warning(f"[twilio] detected TO=our SENDER ({to_whatsapp}); auto-correct -> {inbound_from_ctx}")
+                to_whatsapp = inbound_from_ctx
+            else:
+                log.error(f"[twilio] TO equals our SENDER ({to_whatsapp}) and no valid inbound ctx — abort send.")
+                return
+
+        if not TWILIO_WHATSAPP_FROM:
+            log.error("[twilio] Missing TWILIO_WHATSAPP_FROM")
             return
 
-        kwargs = {"to": to_whatsapp, "body": body}
-
-        if MESSAGING_SERVICE_SID:
-            kwargs["messaging_service_sid"] = MESSAGING_SERVICE_SID
-            send_from = f"MS:{MESSAGING_SERVICE_SID}"
-        else:
-            if not TWILIO_WHATSAPP_FROM:
-                log.error("[twilio] Missing TWILIO_WHATSAPP_FROM")
-                return
-            kwargs["from_"] = TWILIO_WHATSAPP_FROM
-            send_from = TWILIO_WHATSAPP_FROM
-
+        kwargs = {
+            "to": to_whatsapp,
+            "from_": TWILIO_WHATSAPP_FROM,   # 不使用 Messaging Service，显式 from_
+            "body": body
+        }
         if STATUS_CALLBACK_URL:
             kwargs["status_callback"] = STATUS_CALLBACK_URL
 
-        # 关键日志：每条都打印 to/from，方便你在 Console 核对
-        log.info(f"[twilio] creating message to={to_whatsapp} from={send_from} body_len={len(body)}")
+        log.info(f"[twilio] creating message to={to_whatsapp} from={TWILIO_WHATSAPP_FROM} body_len={len(body)}")
         msg = twilio_client.messages.create(**kwargs)
-        log.info(f"[twilio] sent sid={msg.sid} to={to_whatsapp} from={send_from}")
+        log.info(f"[twilio] sent sid={msg.sid} to={to_whatsapp} from={TWILIO_WHATSAPP_FROM}")
     except TwilioRestException as e:
         log.error(f"[twilio] status={getattr(e,'status',None)} code={getattr(e,'code',None)} msg={getattr(e,'msg',str(e))}")
     except Exception as e:
@@ -236,16 +240,15 @@ def send_text(to_whatsapp: str, body: str):
 def health():
     return jsonify({
         "status":"ok",
-        "version":"two-msg-1.1",
+        "version":"two-msg-1.2-nosvc",
         "twilio_from": TWILIO_WHATSAPP_FROM or "(none)",
-        "msvc": MESSAGING_SERVICE_SID or "(none)",
         "verify_sig": VERIFY_TWILIO_SIGNATURE,
         "base": URL_BASE,
         "endpoint": ENDPOINT,
         "status_callback": STATUS_CALLBACK_URL or "(none)"
     })
 
-# 单独给 Twilio 用的状态回执（可选；更推荐统一回到 /api/whatsapp_bot）
+# （可选）单独的状态回执端点；也可以只用 /api/whatsapp_bot
 @app.post("/twilio/status")
 def twilio_status():
     f = request.values
@@ -258,7 +261,7 @@ def twilio_status():
     log.info(f"[status][{direction}] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
     return ("", 200)
 
-# ===== 主 Webhook：同一路径既收入站消息也收状态回执 =====
+# ===== 主 Webhook（入站 + 状态回执同一路径） =====
 @app.post("/api/whatsapp_bot")
 def webhook():
     if not verify_twilio_signature(request):
@@ -266,7 +269,7 @@ def webhook():
 
     form = request.values
 
-    # === ① Twilio 消息状态回执（与入站消息共用同一 URL） ===
+    # ① Twilio 消息状态回执
     if form.get("MessageStatus") or form.get("SmsStatus"):
         sid    = form.get("MessageSid") or form.get("SmsSid")
         status = form.get("MessageStatus") or form.get("SmsStatus")
@@ -277,15 +280,15 @@ def webhook():
         log.info(f"[status][{direction}] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
         return ("", 200)
 
-    # === ② 入站消息：每次请求独立处理（多人并发互不干扰） ===
-    inbound_from = normalize_wa(form.get("From",""))       # 用户号码（收件人to）
+    # ② 入站消息
+    inbound_from = normalize_wa(form.get("From",""))  # 用户号码
     nmed = int(form.get("NumMedia", 0))
     body = (form.get("Body") or "").strip()
     sid  = form.get("MessageSid","") or form.get("SmsSid","")
     rid  = str(uuid.uuid4())[:8]
     log.info(f"[{rid}] IN sid={sid} from={inbound_from} media={nmed} body='{body[:100]}'")
 
-    # ① 立刻英文 ACK（第一条）
+    # 第一条：英文 ACK
     if nmed > 0 and body:
         ack = f"✅ Received your text and 🖼️ {nmed} image(s). Working on it…"
     elif nmed > 0:
@@ -294,9 +297,9 @@ def webhook():
         ack = f"✅ Received your message. Working on it…"
     else:
         ack = "👋 Message received. Working on it…"
-    send_text(inbound_from, ack)
+    send_text(inbound_from, ack, inbound_from_ctx=inbound_from)
 
-    # ② 识别 + 删除 → 结果（第二条）
+    # 识别 + 删除
     ids = extract_ids(body) if body else []
     stats = []
     if nmed>0:
@@ -315,14 +318,15 @@ def webhook():
             stats.append(f"Image {i+1}: {'found' if got else 'no IDs'} (+{len(ids)-before})")
 
     if not ids:
-        send_text(inbound_from, "❌ No parcel IDs found.\n💡 Send a clear screenshot or type: ME176XXXXXXXXXXABC")
+        send_text(inbound_from, "❌ No parcel IDs found.\n💡 Send a clear screenshot or type: ME176XXXXXXXXXXABC", inbound_from_ctx=inbound_from)
         return Response("<Response/>", mimetype="application/xml")
 
     if len(ids) > MAX_BATCH_SIZE:
         preview = "\n".join([f"  • {x}" for x in ids[:5]])
         stattxt = "\n".join(stats) if stats else ""
         send_text(inbound_from,
-                  f"⚠️ Too many IDs: {len(ids)} (max {MAX_BATCH_SIZE}).\n{stattxt}\n\nFirst 5:\n{preview}\n...\nPlease split into smaller batches.")
+                  f"⚠️ Too many IDs: {len(ids)} (max {MAX_BATCH_SIZE}).\n{stattxt}\n\nFirst 5:\n{preview}\n...\nPlease split into smaller batches.",
+                  inbound_from_ctx=inbound_from)
         return Response("<Response/>", mimetype="application/xml")
 
     succ, fail, used = [], [], {}
@@ -350,5 +354,5 @@ def webhook():
         for f in showf:
             lines.append(f"  • {f}")
 
-    send_text(inbound_from, "\n".join(lines))
+    send_text(inbound_from, "\n".join(lines), inbound_from_ctx=inbound_from)
     return Response("<Response/>", mimetype="application/xml")
