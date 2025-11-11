@@ -245,10 +245,26 @@ def twilio_status():
 # ===== 主 Webhook：REST 发两条消息（ACK + 结果），TwiML 空响应 =====
 @app.post("/api/whatsapp_bot")
 def webhook():
+    # 如果你开启了签名校验，这里同样适用于回执请求
     if not verify_twilio_signature(request):
         return ("", 403)
 
     form = request.values
+
+    # === ① Twilio 消息状态回执（与入站消息共用同一 URL） ===
+    # Status Callback 会带这些字段：MessageSid / SmsSid、MessageStatus / SmsStatus、ErrorCode、ErrorMessage ...
+    if form.get("MessageStatus") or form.get("SmsStatus"):
+        sid    = form.get("MessageSid") or form.get("SmsSid")
+        status = form.get("MessageStatus") or form.get("SmsStatus")
+        err    = form.get("ErrorCode")
+        emsg   = form.get("ErrorMessage")
+        to_    = form.get("To")
+        from_  = form.get("From")
+        log.info(f"[status] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
+        # 别向用户回消息；只回 200 即可
+        return ("", 200)
+
+    # === ② 以下才是“入站 WhatsApp 消息”处理 ===
     from_number = form.get("From","")
     nmed = int(form.get("NumMedia", 0))
     body = (form.get("Body") or "").strip()
@@ -322,6 +338,7 @@ def webhook():
             lines.append(f"  • {f}")
 
     send_text(from_number, "\n".join(lines))
+    return Response("<Response/>", mimetype="application/xml")
 
     # ③ 返回空 TwiML（避免 Twilio 再发一条）
     return Response("<Response/>", mimetype="application/xml")
