@@ -3,16 +3,17 @@ import os, re, json, time, base64, logging, requests, itertools, uuid
 from typing import Optional, List
 from flask import Flask, request, jsonify, Response
 
-# Twilio（REST 发送 & 验签）
+# Twilio
 from twilio.rest import Client as TwilioClient
 from twilio.request_validator import RequestValidator
 from twilio.base.exceptions import TwilioRestException
+from twilio.twiml.messaging_response import MessagingResponse
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("wa-bot-two-msg")
 
-# ===== 基本配置（可被环境变量覆盖） =====
+# ===== 基础配置（可用环境变量覆盖） =====
 KEY = os.environ.get("AES_KEY", "1236987410000111").encode()
 IV  = os.environ.get("AES_IV",  "1236987410000111").encode()
 URL_BASE  = os.environ.get("API_BASE", "https://microexpress.com.au")
@@ -31,7 +32,7 @@ TWILIO_AUTH_TOKEN    = os.environ.get("TWILIO_AUTH_TOKEN",  "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()  # e.g. whatsapp:+15558432115
 VERIFY_TWILIO_SIGNATURE = os.environ.get("VERIFY_TWILIO_SIGNATURE", "0") == "1"
 OCR_API_KEY = os.environ.get("OCR_API_KEY", "K87899142388957").strip()
-STATUS_CALLBACK_URL = os.environ.get("STATUS_CALLBACK_URL", "").strip()    # 建议设为 https://<域名>/api/whatsapp_bot
+STATUS_CALLBACK_URL = os.environ.get("STATUS_CALLBACK_URL", "").strip()    # 建议 https://<域名>/api/whatsapp_bot 或 /twilio/status
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
 
@@ -71,13 +72,13 @@ def extract_ids(text: str) -> List[str]:
     log.info(f"[extract] found {len(out)}: {out}")
     return out
 
-# ===== AES & 调后端删除 =====
+# ===== AES & 后端调用 =====
 def pkcs7_pad(b: bytes, bs=16) -> bytes:
     pad = bs - (len(b) % bs)
     return b + bytes([pad])*pad
 
 def make_data_field(payload: dict) -> str:
-    from Crypto.Cipher import AES  # 延迟导入，防止无库时导入期即崩
+    from Crypto.Cipher import AES  # 延迟导入，避免无库导入期崩
     cipher = AES.new(KEY, AES.MODE_CBC, IV)
     ct = cipher.encrypt(pkcs7_pad(json.dumps(payload, separators=(',',':')).encode()))
     return base64.b64encode(ct).decode()
@@ -169,9 +170,9 @@ def process_image(img: bytes) -> List[str]:
     text = ocr_space(img)
     return extract_ids(text or "") if text else []
 
-# ===== 通用 =====
+# ===== 工具函数 =====
 def normalize_wa(num: str) -> str:
-    """确保是 whatsapp:+E164；已带前缀则原样。"""
+    """确保号码是 whatsapp:+E164；已带前缀则原样。"""
     num = (num or "").strip()
     if not num:
         return num
@@ -192,9 +193,9 @@ def verify_twilio_signature(req) -> bool:
     if not ok: log.warning(f"[sig] failed url={url}")
     return ok
 
-# ===== 发送（强制收件人为入站 From；不使用 Messaging Service） =====
+# ===== 发送（强制回入站 From；不用 Messaging Service） =====
 def send_text(to_whatsapp: str, body: str, inbound_from_ctx: str = ""):
-    """强制把消息发回入站 From（用户号码）。忽略任何错误传入的 to。"""
+    """强制把消息发回入站 From（用户号码）。"""
     if not twilio_client:
         log.warning("[twilio] REST client not configured")
         return
@@ -233,7 +234,7 @@ def send_text(to_whatsapp: str, body: str, inbound_from_ctx: str = ""):
 def health():
     return jsonify({
         "status":"ok",
-        "version":"two-msg-1.3-forced-inbound",
+        "version":"two-msg-ack-first-1.0",
         "twilio_from": TWILIO_WHATSAPP_FROM or "(none)",
         "verify_sig": VERIFY_TWILIO_SIGNATURE,
         "base": URL_BASE,
@@ -254,10 +255,19 @@ def twilio_status():
     log.info(f"[status][{direction}] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
     return ("", 200)
 
-# ===== 主 Webhook（入站 + 状态回执同一路径） =====
+# ===== 主 Webhook（入站 + 状态回执同一路径；TwiML 先ACK） =====
 @app.post("/api/whatsapp_bot")
 def webhook():
+    # 原始入参日志（即使验签失败也能看到）
+    try:
+        log.info(f"[raw] headers={dict(request.headers)}")
+        log.info(f"[raw] form={request.form.to_dict(flat=False)}")
+    except Exception:
+        pass
+
+    # 验签（可关闭）
     if not verify_twilio_signature(request):
+        log.warning("[sig] verification failed -> 403")
         return ("", 403)
 
     form = request.values
@@ -274,14 +284,14 @@ def webhook():
         return ("", 200)
 
     # ② 入站消息
-    inbound_from = normalize_wa(form.get("From",""))  # 用户号码
+    inbound_from = normalize_wa(form.get("From",""))  # 发消息的用户
     nmed = int(form.get("NumMedia", 0))
     body = (form.get("Body") or "").strip()
     sid  = form.get("MessageSid","") or form.get("SmsSid","")
     rid  = str(uuid.uuid4())[:8]
     log.info(f"[{rid}] IN sid={sid} from={inbound_from} media={nmed} body='{body[:100]}'")
 
-    # 第一条：英文 ACK
+    # —— TwiML 先 ACK（必达）——
     if nmed > 0 and body:
         ack = f"✅ Received your text and 🖼️ {nmed} image(s). Working on it…"
     elif nmed > 0:
@@ -290,62 +300,71 @@ def webhook():
         ack = f"✅ Received your message. Working on it…"
     else:
         ack = "👋 Message received. Working on it…"
-    send_text(inbound_from, ack, inbound_from_ctx=inbound_from)
+    twiml = MessagingResponse()
+    twiml.message(ack)
+    ack_xml = str(twiml)
 
-    # 识别 + 删除
-    ids = extract_ids(body) if body else []
-    stats = []
-    if nmed>0:
-        for i in range(nmed):
-            mu = form.get(f"MediaUrl{i}", "")
-            mt = form.get(f"MediaContentType{i}", "")
-            if not mu or not (mt or "").startswith("image/"):
-                stats.append(f"Image {i+1}: not an image"); continue
-            img = dl_media(mu)
-            if not img:
-                stats.append(f"Image {i+1}: download failed"); continue
-            before = len(ids)
-            got = process_image(img)
-            for g in got:
-                if g not in ids: ids.append(g)
-            stats.append(f"Image {i+1}: {'found' if got else 'no IDs'} (+{len(ids)-before})")
+    # —— 识别 + 删除，完成后用 REST 回结果 —— 
+    try:
+        ids = extract_ids(body) if body else []
+        stats = []
+        if nmed>0:
+            for i in range(nmed):
+                mu = form.get(f"MediaUrl{i}", "")
+                mt = form.get(f"MediaContentType{i}", "")
+                if not mu or not (mt or "").startswith("image/"):
+                    stats.append(f"Image {i+1}: not an image"); continue
+                img = dl_media(mu)
+                if not img:
+                    stats.append(f"Image {i+1}: download failed"); continue
+                before = len(ids)
+                got = process_image(img)
+                for g in got:
+                    if g not in ids: ids.append(g)
+                stats.append(f"Image {i+1}: {'found' if got else 'no IDs'} (+{len(ids)-before})")
 
-    if not ids:
-        send_text(inbound_from, "❌ No parcel IDs found.\n💡 Send a clear screenshot or type: ME176XXXXXXXXXXABC", inbound_from_ctx=inbound_from)
-        return Response("<Response/>", mimetype="application/xml")
+        if not ids:
+            send_text(inbound_from, "❌ No parcel IDs found.\n💡 Send a clear screenshot or type: ME176XXXXXXXXXXABC",
+                      inbound_from_ctx=inbound_from)
+            return Response(ack_xml, mimetype="application/xml")
 
-    if len(ids) > MAX_BATCH_SIZE:
-        preview = "\n".join([f"  • {x}" for x in ids[:5]])
-        stattxt = "\n".join(stats) if stats else ""
-        send_text(inbound_from,
-                  f"⚠️ Too many IDs: {len(ids)} (max {MAX_BATCH_SIZE}).\n{stattxt}\n\nFirst 5:\n{preview}\n...\nPlease split into smaller batches.",
-                  inbound_from_ctx=inbound_from)
-        return Response("<Response/>", mimetype="application/xml")
+        if len(ids) > MAX_BATCH_SIZE:
+            preview = "\n".join([f"  • {x}" for x in ids[:5]])
+            stattxt = "\n".join(stats) if stats else ""
+            send_text(
+                inbound_from,
+                f"⚠️ Too many IDs: {len(ids)} (max {MAX_BATCH_SIZE}).\n{stattxt}\n\nFirst 5:\n{preview}\n...\nPlease split into smaller batches.",
+                inbound_from_ctx=inbound_from
+            )
+            return Response(ack_xml, mimetype="application/xml")
 
-    succ, fail, used = [], [], {}
-    for pid in ids:
-        ok, res = delete_with_variants(pid)
-        if ok:
-            succ.append(pid)
-            if res.get("used") and res["used"] != pid:
-                used[pid] = res["used"]
-        else:
-            fail.append(pid)
+        succ, fail, used = [], [], {}
+        for pid in ids:
+            ok, res = delete_with_variants(pid)
+            if ok:
+                succ.append(pid)
+                if res.get("used") and res["used"] != pid:
+                    used[pid] = res["used"]
+            else:
+                fail.append(pid)
 
-    lines = [f"📦 Total {len(ids)} | ✅ Deleted {len(succ)} | ❌ Failed {len(fail)}"]
-    if stats:
-        lines.append(""); lines.append("📊 Recognition summary:"); lines.append("\n".join(stats))
-    if succ:
-        lines.append(""); lines.append(f"✅ Deleted ({len(succ)}):")
-        show = succ if len(succ)<=12 else succ[:12] + [f"... and {len(succ)-12} more"]
-        for s in show:
-            note = f" (used {used[s]})" if s in used else ""
-            lines.append(f"  • {s}{note}")
-    if fail:
-        lines.append(""); lines.append(f"❌ Failed ({len(fail)}):")
-        showf = fail if len(fail)<=8 else fail[:8] + [f"... and {len(fail)-8} more"]
-        for f in showf:
-            lines.append(f"  • {f}")
+        lines = [f"📦 Total {len(ids)} | ✅ Deleted {len(succ)} | ❌ Failed {len(fail)}"]
+        if stats:
+            lines.append(""); lines.append("📊 Recognition summary:"); lines.append("\n".join(stats))
+        if succ:
+            lines.append(""); lines.append(f"✅ Deleted ({len(succ)}):")
+            show = succ if len(succ)<=12 else succ[:12] + [f"... and {len(succ)-12} more"]
+            for s in show:
+                note = f" (used {used[s]})" if s in used else ""
+                lines.append(f"  • {s}{note}")
+        if fail:
+            lines.append(""); lines.append(f"❌ Failed ({len(fail)}):")
+            showf = fail if len(fail)<=8 else fail[:8] + [f"... and {len(fail)-8} more"]
+            for f in showf:
+                lines.append(f"  • {f}")
 
-    send_text(inbound_from, "\n".join(lines), inbound_from_ctx=inbound_from)
-    return Response("<Response/>", mimetype="application/xml")
+        send_text(inbound_from, "\n".join(lines), inbound_from_ctx=inbound_from)
+        return Response(ack_xml, mimetype="application/xml")
+    except Exception as e:
+        log.exception(f"[{rid}] pipeline error: {e}")
+        return Response(ack_xml, mimetype="application/xml")
