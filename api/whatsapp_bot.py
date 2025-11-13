@@ -3,7 +3,6 @@ import os, re, json, time, base64, logging, requests, itertools, uuid
 from typing import Optional, List
 from flask import Flask, request, jsonify, Response
 
-# Twilio
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
 
@@ -11,7 +10,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("wa-bot-two-msg-twiml-only")
 
-# ===== 基础配置（可用环境变量覆盖） =====
+# ===== 基础配置 =====
 KEY = os.environ.get("AES_KEY", "1236987410000111").encode()
 IV  = os.environ.get("AES_IV",  "1236987410000111").encode()
 URL_BASE  = os.environ.get("API_BASE", "https://microexpress.com.au")
@@ -28,12 +27,12 @@ OCR_TIMEOUT     = 10
 MAX_BATCH_SIZE  = 20
 MAX_VARIANTS    = 8
 
-# ===== Twilio 验签配置 =====
+TWILIO_ACCOUNT_SID       = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN        = os.environ.get("TWILIO_AUTH_TOKEN",  "").strip()
 VERIFY_TWILIO_SIGNATURE  = os.environ.get("VERIFY_TWILIO_SIGNATURE", "0") == "1"
 OCR_API_KEY              = os.environ.get("OCR_API_KEY", "K87899142388957").strip()
 
-# ===== 文本抽取辅助 =====
+# ===== 文本归一化 & ID 解析 =====
 CHAR_REPL = {
     'А':'A','В':'B','С':'C','Е':'E','Н':'H','І':'I','Ј':'J','К':'K','М':'M','О':'O','Р':'P','Ѕ':'S','Т':'T','Х':'X','У':'Y',
     'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y'
@@ -47,36 +46,67 @@ def normalize_text(s: str) -> str:
 def fix_ocr(s: str) -> str:
     return normalize_text(s).upper()
 
-def canon_barcode(raw: str) -> Optional[str]:
+def canon_barcode_loose(raw: str) -> Optional[str]:
+    """
+    更宽松的规范化：
+    - 只要求以 ME 开头，总长度 >= 18
+    - 结构：ME + 3(系列) + 10(数字) + 3(任意字母数字)
+    - 系列和中间 10 位允许 I/L/O，并纠正为 1/1/0
+    """
     s = fix_ocr(raw)
-    m = re.match(r'^ME([0-9OIL]{3})([0-9O]{10})([A-Z0-9O]{3})$', s)
-    if not m:
+    if not s.startswith("ME"):
         return None
-    series, mid10, last3 = m.groups()
-    series = series.replace('I', '1').replace('L', '1').replace('O', '0')
-    mid10  = mid10.replace('O', '0')
+    core = s[2:]
+    if len(core) < 16:     # 3 + 10 + 3 = 16
+        return None
+
+    series = core[:3]
+    mid10  = core[3:13]
+    last3  = core[13:16]
+
+    # 纠错：I/L/O -> 1/1/0
+    series = series.replace("I", "1").replace("L", "1").replace("O", "0")
+    mid10  = mid10.replace("O", "0").replace("I", "1").replace("L", "1")
+
     if not (series.isdigit() and mid10.isdigit()):
         return None
+
     return f"ME{series}{mid10}{last3}"
 
 def extract_ids(text: str) -> List[str]:
-    t = fix_ocr(re.sub(r'\s+', '', text))
-    cands = re.findall(r'ME[0-9OIL]{3}[0-9O]{10}[A-Z0-9O]{3}', t)
+    """
+    从文本中提取 ME 编号：
+    - 去掉所有空白
+    - 先找 ME + 16~20 个字母数字 的候选
+    - 再用 canon_barcode_loose 做规范化 + 去重
+    """
+    raw = text or ""
+    compact = re.sub(r'\s+', '', raw)
+    t = fix_ocr(compact)
+
+    log.info(f"[extract] raw='{raw[:100]}'")
+    log.info(f"[extract] norm='{t[:100]}'")
+
+    # 宽松候选：以 ME 开头，长度够长
+    candidates = re.findall(r'ME[0-9A-Z]{16,20}', t)
+    log.info(f"[extract] candidates={candidates}")
+
     out: List[str] = []
-    for c in cands:
-        cc = canon_barcode(c)
+    for c in candidates:
+        cc = canon_barcode_loose(c)
         if cc and cc not in out:
             out.append(cc)
-    log.info(f"[extract] found {len(out)}: {out}")
+
+    log.info(f"[extract] found {len(out)} IDs: {out}")
     return out
 
-# ===== AES & 后端调用 =====
+# ===== AES & 后端删除 =====
 def pkcs7_pad(b: bytes, bs=16) -> bytes:
     pad = bs - (len(b) % bs)
     return b + bytes([pad]) * pad
 
 def make_data_field(payload: dict) -> str:
-    from Crypto.Cipher import AES  # 延迟导入
+    from Crypto.Cipher import AES
     cipher = AES.new(KEY, AES.MODE_CBC, IV)
     ct = cipher.encrypt(pkcs7_pad(json.dumps(payload, separators=(',', ':')).encode()))
     return base64.b64encode(ct).decode()
@@ -130,13 +160,10 @@ def delete_with_variants(code: str):
             return True, {"used": cand, "result": res}
     return False, {"tried": tried}
 
-# ===== 媒体 & OCR =====
+# ===== 媒体 / QR / OCR =====
 def dl_media(url: str) -> Optional[bytes]:
     try:
-        # WhatsApp 媒体 URL 必须带 Basic Auth
-        account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
-        auth_token  = TWILIO_AUTH_TOKEN
-        r = requests.get(url, auth=(account_sid, auth_token), timeout=8)
+        r = requests.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=8)
         if r.status_code == 200:
             log.info(f"[media] {len(r.content)} bytes")
             return r.content
@@ -144,6 +171,32 @@ def dl_media(url: str) -> Optional[bytes]:
     except Exception as e:
         log.warning(f"[media] {e}")
     return None
+
+def decode_qr_goqr(img: bytes) -> Optional[str]:
+    try:
+        r = requests.post(
+            "https://api.qrserver.com/v1/read-qr-code/",
+            files={'file': ('image.jpg', img, 'image/jpeg')},
+            timeout=10
+        )
+        if r.status_code != 200:
+            log.warning(f"[qr] http {r.status_code}")
+            return None
+        js = r.json()
+        if not js or not isinstance(js, list):
+            return None
+        symbols = js[0].get("symbol", [])
+        if not symbols:
+            return None
+        data = symbols[0].get("data")
+        if not data:
+            return None
+        log.info(f"[qr] data='{data[:100]}'")
+        ids = extract_ids(data)
+        return ids[0] if ids else None
+    except Exception as e:
+        log.warning(f"[qr] {e}")
+        return None
 
 def ocr_space(img: bytes) -> Optional[str]:
     try:
@@ -171,8 +224,17 @@ def ocr_space(img: bytes) -> Optional[str]:
         return None
 
 def process_image(img: bytes) -> List[str]:
+    # 1️⃣ 先尝试二维码
+    qr_id = decode_qr_goqr(img)
+    if qr_id:
+        log.info(f"[image] QR hit: {qr_id}")
+        return [qr_id]
+
+    # 2️⃣ QR 没中，再 OCR
     text = ocr_space(img)
-    return extract_ids(text or "") if text else []
+    if not text:
+        return []
+    return extract_ids(text)
 
 # ===== Twilio 验签 =====
 def verify_twilio_signature(req) -> bool:
@@ -194,14 +256,13 @@ def verify_twilio_signature(req) -> bool:
 @app.get("/api/whatsapp_bot")
 def health():
     return jsonify({
-      "status": "ok",
-      "version": "two-msg-twiml-only-1.0",
-      "verify_sig": VERIFY_TWILIO_SIGNATURE,
-      "base": URL_BASE,
-      "endpoint": ENDPOINT
+        "status": "ok",
+        "version": "two-msg-twiml-loose-1.0",
+        "verify_sig": VERIFY_TWILIO_SIGNATURE,
+        "base": URL_BASE,
+        "endpoint": ENDPOINT
     })
 
-# 可选：专门给 outbound status 用（如果以后要在 Twilio Console 里配）
 @app.post("/twilio/status")
 def twilio_status():
     f = request.values
@@ -215,32 +276,30 @@ def twilio_status():
     log.info(f"[status][{direction}] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
     return ("", 200)
 
-# ===== 主 Webhook：TwiML 直接发“两条消息” =====
+# ===== 主 Webhook =====
 @app.post("/api/whatsapp_bot")
 def webhook():
-    # 打印原始请求，便于排查
     try:
         log.info(f"[raw] headers={dict(request.headers)}")
         log.info(f"[raw] form={request.form.to_dict(flat=False)}")
     except Exception:
         pass
 
-    # 验签
     if not verify_twilio_signature(request):
         log.warning("[sig] verification failed -> 403")
         return ("", 403)
 
     form = request.values
 
-    # ① 如果是 outbound 的 status callback（SM 开头 + 有 MessageStatus），直接 200 返回
+    # 识别并忽略 outbound status callback
     sid_any = form.get("MessageSid") or form.get("SmsSid") or ""
-    has_status_field = bool(form.get("MessageStatus") or form.get("SmsStatus"))
+    has_message_status = bool(form.get("MessageStatus"))  # 只看 MessageStatus，避免误杀 inbound
     is_outbound_sid  = sid_any.startswith("SM")
-    is_status_callback = has_status_field and is_outbound_sid
+    is_status_callback = has_message_status and is_outbound_sid
 
     if is_status_callback:
         sid    = sid_any
-        status = form.get("MessageStatus") or form.get("SmsStatus")
+        status = form.get("MessageStatus")
         err    = form.get("ErrorCode")
         emsg   = form.get("ErrorMessage")
         to_    = form.get("To")
@@ -248,7 +307,7 @@ def webhook():
         log.info(f"[status][outbound] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
         return ("", 200)
 
-    # ② 真正的入站 WhatsApp 消息
+    # ===== 入站消息 =====
     from_number = form.get("From", "")
     nmed = int(form.get("NumMedia", 0))
     body = (form.get("Body") or "").strip()
@@ -256,11 +315,14 @@ def webhook():
     rid  = str(uuid.uuid4())[:8]
     log.info(f"[{rid}] IN sid={sid} from={from_number} media={nmed} body='{body[:100]}'")
 
-    # ====== 开始处理：识别 ID + 删除 ======
-    ids = extract_ids(body) if body else []
+    ids: List[str] = []
     stats: List[str] = []
 
-    # 识别图片
+    # 文本先抽
+    if body:
+        ids = extract_ids(body)
+
+    # 图片再抽
     if nmed > 0:
         for i in range(nmed):
             mu = form.get(f"MediaUrl{i}", "")
@@ -279,10 +341,10 @@ def webhook():
                     ids.append(g)
             stats.append(f"Image {i+1}: {'found' if got else 'no IDs'} (+{len(ids)-before})")
 
-    # ====== 组装 TwiML 回复：两条 Message ======
+    # ===== TwiML 两条消息 =====
     resp = MessagingResponse()
 
-    # 第一条：英文 ACK（你要求的）
+    # 第一条：ACK
     if nmed > 0 and body:
         ack = f"✅ Received your text and 🖼️ {nmed} image(s). Working on it…"
     elif nmed > 0:
@@ -293,10 +355,11 @@ def webhook():
         ack = "👋 Message received. Working on it…"
     resp.message(ack)
 
-    # 第二条：根据不同情况返回结果
+    # 第二条：结果
     if not ids:
-        # 没有识别到任何包裹号
-        resp.message("❌ No parcel IDs found.\n💡 Send a clear screenshot or type: ME176XXXXXXXXXXABC")
+        # 把 stats 也发回去，方便你调试
+        extra = ("\n\n📊 Image summary:\n" + "\n".join(stats)) if stats else ""
+        resp.message("❌ No parcel IDs found.\n💡 Send a clear screenshot or type: ME176XXXXXXXXXXABC" + extra)
         return Response(str(resp), mimetype="application/xml")
 
     if len(ids) > MAX_BATCH_SIZE:
@@ -309,7 +372,7 @@ def webhook():
         resp.message(body2)
         return Response(str(resp), mimetype="application/xml")
 
-    # 有 ID，调删除接口
+    # 调删除接口
     succ: List[str] = []
     fail: List[str] = []
     used: dict[str, str] = {}
@@ -323,7 +386,6 @@ def webhook():
         else:
             fail.append(pid)
 
-    # 组装结果文本
     lines: List[str] = [f"📦 Total {len(ids)} | ✅ Deleted {len(succ)} | ❌ Failed {len(fail)}"]
     if stats:
         lines.append("")
