@@ -3,14 +3,18 @@ import os, re, json, time, base64, logging, requests, itertools, uuid
 from typing import Optional, List
 from flask import Flask, request, jsonify, Response
 
-from twilio.twiml.messaging_response import MessagingResponse
+from twilio.rest import Client as TwilioClient
 from twilio.request_validator import RequestValidator
+from twilio.base.exceptions import TwilioRestException
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("wa-bot-two-msg-twiml-only")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("wa-bot-two-msg")
 
-# ===== 基础配置 =====
+# ===== 基本配置 =====
 KEY = os.environ.get("AES_KEY", "1236987410000111").encode()
 IV  = os.environ.get("AES_IV",  "1236987410000111").encode()
 URL_BASE  = os.environ.get("API_BASE", "https://microexpress.com.au")
@@ -27,12 +31,16 @@ OCR_TIMEOUT     = 10
 MAX_BATCH_SIZE  = 20
 MAX_VARIANTS    = 8
 
-TWILIO_ACCOUNT_SID       = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
-TWILIO_AUTH_TOKEN        = os.environ.get("TWILIO_AUTH_TOKEN",  "").strip()
-VERIFY_TWILIO_SIGNATURE  = os.environ.get("VERIFY_TWILIO_SIGNATURE", "0") == "1"
-OCR_API_KEY              = os.environ.get("OCR_API_KEY", "K87899142388957").strip()
+# ===== 环境变量（Twilio）=====
+TWILIO_ACCOUNT_SID   = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN    = os.environ.get("TWILIO_AUTH_TOKEN",  "").strip()
+TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()  # e.g. whatsapp:+15558432115
+VERIFY_TWILIO_SIGNATURE = os.environ.get("VERIFY_TWILIO_SIGNATURE", "0") == "1"
+OCR_API_KEY = os.environ.get("OCR_API_KEY", "K87899142388957").strip()
 
-# ===== 文本归一化 & ID 解析 =====
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
+
+# ===== 文本抽取 =====
 CHAR_REPL = {
     'А':'A','В':'B','С':'C','Е':'E','Н':'H','І':'I','Ј':'J','К':'K','М':'M','О':'O','Р':'P','Ѕ':'S','Т':'T','Х':'X','У':'Y',
     'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y'
@@ -46,61 +54,32 @@ def normalize_text(s: str) -> str:
 def fix_ocr(s: str) -> str:
     return normalize_text(s).upper()
 
-def canon_barcode_loose(raw: str) -> Optional[str]:
-    """
-    更宽松的规范化：
-    - 只要求以 ME 开头，总长度 >= 18
-    - 结构：ME + 3(系列) + 10(数字) + 3(任意字母数字)
-    - 系列和中间 10 位允许 I/L/O，并纠正为 1/1/0
-    """
+def canon_barcode(raw: str) -> Optional[str]:
     s = fix_ocr(raw)
-    if not s.startswith("ME"):
+    m = re.match(r'^ME([0-9OIL]{3})([0-9O]{10})([A-Z0-9O]{3})$', s)
+    if not m:
         return None
-    core = s[2:]
-    if len(core) < 16:     # 3 + 10 + 3 = 16
-        return None
-
-    series = core[:3]
-    mid10  = core[3:13]
-    last3  = core[13:16]
-
-    # 纠错：I/L/O -> 1/1/0
-    series = series.replace("I", "1").replace("L", "1").replace("O", "0")
-    mid10  = mid10.replace("O", "0").replace("I", "1").replace("L", "1")
-
+    series, mid10, last3 = m.groups()
+    series = series.replace('I', '1').replace('L', '1').replace('O', '0')
+    mid10  = mid10.replace('O', '0')
     if not (series.isdigit() and mid10.isdigit()):
         return None
-
     return f"ME{series}{mid10}{last3}"
 
 def extract_ids(text: str) -> List[str]:
-    """
-    从文本中提取 ME 编号：
-    - 去掉所有空白
-    - 先找 ME + 16~20 个字母数字 的候选
-    - 再用 canon_barcode_loose 做规范化 + 去重
-    """
-    raw = text or ""
-    compact = re.sub(r'\s+', '', raw)
-    t = fix_ocr(compact)
-
-    log.info(f"[extract] raw='{raw[:100]}'")
-    log.info(f"[extract] norm='{t[:100]}'")
-
-    # 宽松候选：以 ME 开头，长度够长
-    candidates = re.findall(r'ME[0-9A-Z]{16,20}', t)
-    log.info(f"[extract] candidates={candidates}")
-
+    sample = text.replace("\n", " ")[:120]
+    log.info(f"[extract] sample='{sample}'")
+    t = fix_ocr(re.sub(r'\s+', '', text))
+    cands = re.findall(r'ME[0-9OIL]{3}[0-9O]{10}[A-Z0-9O]{3}', t)
     out: List[str] = []
-    for c in candidates:
-        cc = canon_barcode_loose(c)
+    for c in cands:
+        cc = canon_barcode(c)
         if cc and cc not in out:
             out.append(cc)
-
-    log.info(f"[extract] found {len(out)} IDs: {out}")
+    log.info(f"[extract] found {len(out)}: {out}")
     return out
 
-# ===== AES & 后端删除 =====
+# ===== 加密 & 后端调用 =====
 def pkcs7_pad(b: bytes, bs=16) -> bytes:
     pad = bs - (len(b) % bs)
     return b + bytes([pad]) * pad
@@ -120,8 +99,10 @@ def post_delete(barcode: str, reason=DEFAULT_REASON, addr=DEFAULT_ADDRESS):
             "myme_timestamp": int(time.time() * 1000)
         })}
         url = URL_BASE + ENDPOINT
+        last_resp = None
         for i in range(1, 3):
             r = requests.post(url, json=body, headers=HEADERS, timeout=HTTP_TIMEOUT)
+            last_resp = r
             if r.status_code == 200:
                 try:
                     js = r.json()
@@ -129,7 +110,7 @@ def post_delete(barcode: str, reason=DEFAULT_REASON, addr=DEFAULT_ADDRESS):
                     js = {"raw": r.text}
                 return js.get("code") == 200, js
             time.sleep(0.4 * i)
-        return False, {"error": f"http {r.status_code}", "text": r.text[:200]}
+        return False, {"error": f"http {last_resp.status_code}", "text": last_resp.text[:200]}
     except Exception as e:
         return False, {"error": f"{type(e).__name__}: {e}"}
 
@@ -157,10 +138,10 @@ def delete_with_variants(code: str):
         ok, res = post_delete(cand)
         tried.append((cand, ok))
         if ok:
-            return True, {"used": cand, "result": res}
+            return True, {"used": cand, "result": res, "tried": tried}
     return False, {"tried": tried}
 
-# ===== 媒体 / QR / OCR =====
+# ===== 媒体 & OCR =====
 def dl_media(url: str) -> Optional[bytes]:
     try:
         r = requests.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=8)
@@ -171,32 +152,6 @@ def dl_media(url: str) -> Optional[bytes]:
     except Exception as e:
         log.warning(f"[media] {e}")
     return None
-
-def decode_qr_goqr(img: bytes) -> Optional[str]:
-    try:
-        r = requests.post(
-            "https://api.qrserver.com/v1/read-qr-code/",
-            files={'file': ('image.jpg', img, 'image/jpeg')},
-            timeout=10
-        )
-        if r.status_code != 200:
-            log.warning(f"[qr] http {r.status_code}")
-            return None
-        js = r.json()
-        if not js or not isinstance(js, list):
-            return None
-        symbols = js[0].get("symbol", [])
-        if not symbols:
-            return None
-        data = symbols[0].get("data")
-        if not data:
-            return None
-        log.info(f"[qr] data='{data[:100]}'")
-        ids = extract_ids(data)
-        return ids[0] if ids else None
-    except Exception as e:
-        log.warning(f"[qr] {e}")
-        return None
 
 def ocr_space(img: bytes) -> Optional[str]:
     try:
@@ -224,27 +179,22 @@ def ocr_space(img: bytes) -> Optional[str]:
         return None
 
 def process_image(img: bytes) -> List[str]:
-    # 1️⃣ 先尝试二维码
-    qr_id = decode_qr_goqr(img)
-    if qr_id:
-        log.info(f"[image] QR hit: {qr_id}")
-        return [qr_id]
-
-    # 2️⃣ QR 没中，再 OCR
     text = ocr_space(img)
     if not text:
         return []
     return extract_ids(text)
 
-# ===== Twilio 验签 =====
+# ===== Twilio 帮助函数 =====
 def verify_twilio_signature(req) -> bool:
     if not VERIFY_TWILIO_SIGNATURE or not TWILIO_AUTH_TOKEN:
         return True
     validator = RequestValidator(TWILIO_AUTH_TOKEN)
+
     proto = req.headers.get('X-Forwarded-Proto', req.scheme)
     host  = req.headers.get('X-Forwarded-Host') or req.headers.get('Host')
     path  = req.full_path if req.query_string else req.path
     url   = f"{proto}://{host}{path}".rstrip('?')
+
     params = req.form.to_dict(flat=True)
     sig    = req.headers.get("X-Twilio-Signature", "")
     ok = validator.validate(url, params, sig)
@@ -252,61 +202,89 @@ def verify_twilio_signature(req) -> bool:
         log.warning(f"[sig] failed url={url}")
     return ok
 
-# ===== 健康检查 & 独立 status 端点 =====
+def send_text(to_whatsapp: str, body: str):
+    if not twilio_client:
+        log.warning("[twilio] REST client not configured")
+        return
+    try:
+        kwargs = {
+            "to": to_whatsapp,
+            "from_": TWILIO_WHATSAPP_FROM,
+            "body": body
+        }
+        msg = twilio_client.messages.create(**kwargs)
+        log.info(f"[twilio] sent sid={msg.sid}")
+    except TwilioRestException as e:
+        log.error(f"[twilio] status={getattr(e, 'status', None)} code={getattr(e, 'code', None)} msg={getattr(e, 'msg', str(e))}")
+    except Exception as e:
+        log.error(f"[twilio] {e}")
+
+# ===== 健康检查 =====
 @app.get("/api/whatsapp_bot")
 def health():
     return jsonify({
         "status": "ok",
-        "version": "two-msg-twiml-loose-1.1",
+        "version": "two-msg-1.1",
+        "twilio_from": TWILIO_WHATSAPP_FROM or "(none)",
         "verify_sig": VERIFY_TWILIO_SIGNATURE,
         "base": URL_BASE,
         "endpoint": ENDPOINT
     })
 
-@app.post("/twilio/status")
-def twilio_status():
-    f = request.values
-    sid    = f.get("MessageSid") or f.get("SmsSid")
-    status = f.get("MessageStatus") or f.get("SmsStatus")
-    err    = f.get("ErrorCode")
-    emsg   = f.get("ErrorMessage")
-    to_    = f.get("To")
-    from_  = f.get("From")
-    direction = "outbound" if (sid or "").startswith("SM") else "inbound"
-    log.info(f"[status][{direction}] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
-    return ("", 200)
-
-# ===== 主 Webhook：只处理入站 WhatsApp 消息 =====
+# ===== 主 Webhook =====
 @app.post("/api/whatsapp_bot")
-def webhook():
-    try:
-        log.info(f"[raw] headers={dict(request.headers)}")
-        log.info(f"[raw] form={request.form.to_dict(flat=False)}")
-    except Exception:
-        pass
-
+def whatsapp_webhook():
     if not verify_twilio_signature(request):
-        log.warning("[sig] verification failed -> 403")
         return ("", 403)
 
-    form = request.values
+    # 统一拿成 dict，方便日志
+    form = request.values.to_dict(flat=True)
+    log.info(f"[raw] headers={dict(request.headers)}")
+    log.info(f"[raw] form={form}")
 
-    # 这里不再判断什么 status callback，所有打到这个 URL 的都按“入站消息”处理
+    # ① Twilio 状态回调（只看 MessageStatus，不再看 SmsStatus）
+    if form.get("MessageStatus"):
+        sid    = form.get("MessageSid") or form.get("SmsSid")
+        status = form.get("MessageStatus")
+        err    = form.get("ErrorCode")
+        emsg   = form.get("ErrorMessage")
+        to_    = form.get("To")
+        from_  = form.get("From")
+        log.info(f"[status][outbound] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
+        return ("", 200)
+
+    # ② 正常入站 WhatsApp 消息
     from_number = form.get("From", "")
-    nmed = int(form.get("NumMedia", 0))
+    to_number   = form.get("To", "")
+    nmed = int(form.get("NumMedia", "0") or "0")
     body = (form.get("Body") or "").strip()
     sid  = form.get("MessageSid") or form.get("SmsSid") or ""
     rid  = str(uuid.uuid4())[:8]
-    log.info(f"[{rid}] IN sid={sid} from={from_number} media={nmed} body='{body[:100]}'")
 
+    log.info(f"[inbound][{rid}] sid={sid} from={from_number} to={to_number} media={nmed} body='{body[:120]}'")
+
+    # 第一条快速 ACK（英文）
+    if nmed > 0 and body:
+        ack = f"✅ Received your text and 🖼️ {nmed} image(s). Working on it…"
+    elif nmed > 0:
+        ack = f"🖼️ Received {nmed} image(s). Working on it…"
+    elif body:
+        ack = "✅ Received your message. Working on it…"
+    else:
+        ack = "👋 Message received. Working on it…"
+
+    send_text(from_number, ack)
+
+    # 开始识别 & 删除
     ids: List[str] = []
     stats: List[str] = []
 
-    # 文本先抽
     if body:
-        ids = extract_ids(body)
+        text_ids = extract_ids(body)
+        if text_ids:
+            ids.extend(text_ids)
+            stats.append(f"Text: found {len(text_ids)} ID(s)")
 
-    # 图片再抽
     if nmed > 0:
         for i in range(nmed):
             mu = form.get(f"MediaUrl{i}", "")
@@ -325,40 +303,34 @@ def webhook():
                     ids.append(g)
             stats.append(f"Image {i+1}: {'found' if got else 'no IDs'} (+{len(ids)-before})")
 
-    # ===== TwiML 两条消息 =====
-    resp = MessagingResponse()
+    log.info(f"[inbound][{rid}] all_ids={ids}")
 
-    # 第一条：ACK
-    if nmed > 0 and body:
-        ack = f"✅ Received your text and 🖼️ {nmed} image(s). Working on it…"
-    elif nmed > 0:
-        ack = f"🖼️ Received {nmed} image(s). Working on it…"
-    elif body:
-        ack = f"✅ Received your message. Working on it…"
-    else:
-        ack = "👋 Message received. Working on it…"
-    resp.message(ack)
-
-    # 第二条：结果
     if not ids:
-        extra = ("\n\n📊 Image summary:\n" + "\n".join(stats)) if stats else ""
-        resp.message("❌ No parcel IDs found.\n💡 Send a clear screenshot or type: ME176XXXXXXXXXXABC" + extra)
-        return Response(str(resp), mimetype="application/xml")
+        send_text(
+            from_number,
+            "❌ No parcel IDs found.\n\n"
+            "💡 Try one of these:\n"
+            "• Send a clearer screenshot\n"
+            "• Send a photo that shows the ME barcode\n"
+            "• Or type: ME176XXXXXXXXXXABC"
+        )
+        return Response("<Response/>", mimetype="application/xml")
 
     if len(ids) > MAX_BATCH_SIZE:
         preview = "\n".join([f"  • {x}" for x in ids[:5]])
         stattxt = "\n".join(stats) if stats else ""
-        body2 = (
+        send_text(
+            from_number,
             f"⚠️ Too many IDs: {len(ids)} (max {MAX_BATCH_SIZE}).\n"
-            f"{stattxt}\n\nFirst 5:\n{preview}\n...\nPlease split into smaller batches."
+            f"{stattxt}\n\n"
+            f"First 5:\n{preview}\n...\n"
+            f"Please split into smaller batches."
         )
-        resp.message(body2)
-        return Response(str(resp), mimetype="application/xml")
+        return Response("<Response/>", mimetype="application/xml")
 
-    # 调删除接口
     succ: List[str] = []
     fail: List[str] = []
-    used: dict[str, str] = {}
+    used: dict = {}
 
     for pid in ids:
         ok, res = delete_with_variants(pid)
@@ -369,7 +341,9 @@ def webhook():
         else:
             fail.append(pid)
 
-    lines: List[str] = [f"📦 Total {len(ids)} | ✅ Deleted {len(succ)} | ❌ Failed {len(fail)}"]
+    lines: List[str] = [
+        f"📦 Total {len(ids)} | ✅ Deleted {len(succ)} | ❌ Failed {len(fail)}"
+    ]
     if stats:
         lines.append("")
         lines.append("📊 Recognition summary:")
@@ -388,5 +362,6 @@ def webhook():
         for f in showf:
             lines.append(f"  • {f}")
 
-    resp.message("\n".join(lines))
-    return Response(str(resp), mimetype="application/xml")
+    send_text(from_number, "\n".join(lines))
+
+    return Response("<Response/>", mimetype="application/xml")
