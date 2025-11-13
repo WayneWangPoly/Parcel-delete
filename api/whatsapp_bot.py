@@ -252,12 +252,12 @@ def verify_twilio_signature(req) -> bool:
         log.warning(f"[sig] failed url={url}")
     return ok
 
-# ===== 健康检查 =====
+# ===== 健康检查 & 独立 status 端点 =====
 @app.get("/api/whatsapp_bot")
 def health():
     return jsonify({
         "status": "ok",
-        "version": "two-msg-twiml-loose-1.0",
+        "version": "two-msg-twiml-loose-1.1",
         "verify_sig": VERIFY_TWILIO_SIGNATURE,
         "base": URL_BASE,
         "endpoint": ENDPOINT
@@ -276,7 +276,7 @@ def twilio_status():
     log.info(f"[status][{direction}] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
     return ("", 200)
 
-# ===== 主 Webhook =====
+# ===== 主 Webhook：只处理入站 WhatsApp 消息 =====
 @app.post("/api/whatsapp_bot")
 def webhook():
     try:
@@ -291,27 +291,11 @@ def webhook():
 
     form = request.values
 
-    # 识别并忽略 outbound status callback
-    sid_any = form.get("MessageSid") or form.get("SmsSid") or ""
-    has_message_status = bool(form.get("MessageStatus"))  # 只看 MessageStatus，避免误杀 inbound
-    is_outbound_sid  = sid_any.startswith("SM")
-    is_status_callback = has_message_status and is_outbound_sid
-
-    if is_status_callback:
-        sid    = sid_any
-        status = form.get("MessageStatus")
-        err    = form.get("ErrorCode")
-        emsg   = form.get("ErrorMessage")
-        to_    = form.get("To")
-        from_  = form.get("From")
-        log.info(f"[status][outbound] sid={sid} status={status} err={err} emsg={emsg} to={to_} from={from_}")
-        return ("", 200)
-
-    # ===== 入站消息 =====
+    # 这里不再判断什么 status callback，所有打到这个 URL 的都按“入站消息”处理
     from_number = form.get("From", "")
     nmed = int(form.get("NumMedia", 0))
     body = (form.get("Body") or "").strip()
-    sid  = sid_any
+    sid  = form.get("MessageSid") or form.get("SmsSid") or ""
     rid  = str(uuid.uuid4())[:8]
     log.info(f"[{rid}] IN sid={sid} from={from_number} media={nmed} body='{body[:100]}'")
 
@@ -357,7 +341,6 @@ def webhook():
 
     # 第二条：结果
     if not ids:
-        # 把 stats 也发回去，方便你调试
         extra = ("\n\n📊 Image summary:\n" + "\n".join(stats)) if stats else ""
         resp.message("❌ No parcel IDs found.\n💡 Send a clear screenshot or type: ME176XXXXXXXXXXABC" + extra)
         return Response(str(resp), mimetype="application/xml")
